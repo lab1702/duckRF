@@ -151,6 +151,31 @@ SELECT CASE
     ELSE error('SMOKE FAIL: rf_reg_quantile intervals/trend wrong')
   END;
 
+-- --------------------------------------------------------------- batch fitting
+-- Growing trees in tree-range batches and UNION-ing them reproduces a one-shot
+-- fit: each tree is grown independently and all per-tree RNG keys on the GLOBAL
+-- tree index. clf is an integer-slot classification (integer features, no
+-- fractional weights), so under threads=1 every node sum is exact and the two
+-- model tables are BIT-IDENTICAL on every column (EXCEPT-diff = 0 both ways),
+-- impurity and the class_counts MAP included.
+CREATE TABLE bat_one AS SELECT * FROM rf_class_fit('clf', 'y', n_trees := 12, seed := 7, max_depth := 6);
+CREATE TABLE bat_uni AS
+      SELECT * FROM rf_class_fit('clf', 'y', n_trees := 12, seed := 7, max_depth := 6, tree_from := 1, tree_to := 5)
+  UNION ALL
+      SELECT * FROM rf_class_fit('clf', 'y', n_trees := 12, seed := 7, max_depth := 6, tree_from := 6, tree_to := 12);
+SELECT CASE
+    WHEN (SELECT count(*) FROM ((SELECT * FROM bat_one EXCEPT SELECT * FROM bat_uni)
+                                UNION ALL
+                                (SELECT * FROM bat_uni EXCEPT SELECT * FROM bat_one))) = 0
+     AND (SELECT count(DISTINCT tree) FROM bat_uni) = 12
+     AND (SELECT DISTINCT n_trees FROM bat_uni) = 12          -- metadata is the TOTAL
+     -- the helper writes the same UNION as text (ceil(12/5) = 3 arms)
+     AND length((SELECT rf_batched_fit_sql('clf', 'y', 'classification', n_trees := 12, batch_size := 5))
+                ) > 0
+    THEN 'PASS  batch UNION == one-shot fit (bit-identical), n_trees metadata is the total'
+    ELSE error('SMOKE FAIL: batched UNION did not reproduce the one-shot fit')
+  END;
+
 -- ------------------------------------------------------ determinism (threads=1)
 -- Same seed -> bit-identical model; a different seed -> a different model. Compare
 -- the scalar structure columns (list/map columns are equal whenever these are).

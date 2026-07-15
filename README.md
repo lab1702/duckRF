@@ -4,7 +4,8 @@ Table macros for DuckDB **1.5+**, no extensions and no driver required. duckRF
 grows a random forest — **classification or regression** — entirely inside
 DuckDB, and gives you **fit**, **predict**, **evaluate**, **out-of-bag**
 scoring, **feature importance**, per-tree predictions and **cross-validation**
-for tuning. Both families take the same arguments and handle **numeric *and*
+for tuning, plus **batch fitting** to grow large forests in a bounded memory
+envelope. Both families take the same arguments and handle **numeric *and*
 categorical features and outcomes** natively: `VARCHAR`/`ENUM` columns are true
 categoricals (subset splits, not one-hot), and the classification outcome can be
 a boolean, an integer, or a string label.
@@ -74,7 +75,8 @@ duckdb < tests/smoke.sql
 
 ## Files
 
-- [rf_macros.sql](rf_macros.sql) — the entire library: both `*_fit` families,
+- [rf_macros.sql](rf_macros.sql) — the entire library: both `*_fit` families
+  (with `tree_from`/`tree_to` batch fitting) and `rf_batched_fit_sql`,
   `*_predict` / `*_predict_trees` / `*_evaluate`, `rf_reg_quantile`
   (quantile-regression-forest prediction intervals), the out-of-bag macros,
   `rf_importance`, `rf_permutation_importance`, `rf_summary`, `rf_cv` /

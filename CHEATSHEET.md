@@ -33,8 +33,10 @@ rf_class_fit(tbl, outcome
              , criterion := 'gini'      -- 'gini' | 'entropy' (bits)
              , seed := 42
              , weights_col := NULL       -- per-row sample weights
-             , class_weight := NULL)     -- NULL | 'balanced'
-rf_reg_fit(tbl, outcome, ... , criterion := 'mse', weights_col := NULL)
+             , class_weight := NULL       -- NULL | 'balanced'
+             , tree_from := NULL, tree_to := NULL)  -- batch fitting (see below)
+rf_reg_fit(tbl, outcome, ... , criterion := 'mse', weights_col := NULL,
+           tree_from := NULL, tree_to := NULL)
    -> the model table (one row per tree node; see schema below)
 ```
 
@@ -42,6 +44,45 @@ rf_reg_fit(tbl, outcome, ... , criterion := 'mse', weights_col := NULL)
 (sklearn's `sqrt` / `1.0`). `max_depth := NULL` grows to purity (hard cap 60);
 the default `20` **does** bind above a few thousand rows — `rf_summary` reports
 `depth_cap_hit`. `VARCHAR`/`ENUM` features are true categoricals (subset splits).
+
+## Batch fitting  (bounded memory; UNION reproduces a one-shot fit)
+
+Fitting is one recursive CTE over all trees, so peak memory ≈ `n_trees × max_depth`
+(~1–1.5 GB/tree at depth 20 on 50k × 20). Grow the forest in memory-bounded
+batches and `UNION` them. `n_trees` stays the **total** (metadata / RNG / OOB);
+`tree_from`/`tree_to` grow only the trees with global index in `[tree_from,
+tree_to]` (a lone `NULL` → `1` / `n_trees`; require `1 ≤ from ≤ to ≤ n_trees`).
+
+```sql
+CREATE TABLE m AS
+      SELECT * FROM rf_reg_fit('big','y', n_trees:=300, max_depth:=18, tree_from:=1,   tree_to:=150)
+  UNION ALL
+      SELECT * FROM rf_reg_fit('big','y', n_trees:=300, max_depth:=18, tree_from:=151, tree_to:=300);
+```
+
+`rf_batched_fit_sql` writes that UNION for you, returned **as text** (fetch & run,
+like `dummy_encode_sql`; `query()` won't take it inline):
+
+```
+rf_batched_fit_sql(tbl, outcome, family        -- 'classification' | 'regression'
+                   , n_trees := 100, batch_size := 10, mtry := NULL, max_depth := 20
+                   , min_samples_split := 2, min_samples_leaf := 1, min_impurity_decrease := 0.0
+                   , sample_frac := 1.0, replace_sample := true, criterion := NULL
+                   , seed := 42, weights_col := NULL, class_weight := NULL)  -> VARCHAR
+```
+
+```python
+sql = con.sql("SELECT rf_batched_fit_sql('big','y','regression', n_trees:=300, batch_size:=50)").fetchone()[0]
+con.sql(f"CREATE TABLE m AS {sql}")
+```
+
+Bit-identical to the one-shot fit for **integer-slot** fits (classification, no
+fractional weights) under `threads=1`. Fractional-slot fits (regression, a
+fractional `weights_col`, `class_weight:='balanced'` on imbalanced classes) are
+**not** bit-identical: shallow-depth structure matches (`DOUBLE` cols to ~1e-9),
+but at the default `max_depth:=20` near-tied splits flip and the forests diverge
+structurally — predictions differ ~0.05–0.15, a *statistically equivalent* (not
+identical) forest. See [GUIDE.md](GUIDE.md).
 
 ## Predict  (na_action ∈ 'null' | 'skip_tree'; n_trees := k uses the first k trees)
 

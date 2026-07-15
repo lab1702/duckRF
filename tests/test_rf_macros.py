@@ -1548,3 +1548,185 @@ class TestQuantile:
             "SELECT count(*) c FROM (SELECT quantile_pred FROM "
             "rf_reg_quantile('qm','qtr','y',[0.5]::DOUBLE[], newdata:='qten')) WHERE quantile_pred IS NULL").c[0]
         assert n_null >= 1
+
+
+# ===========================================================================
+# 10. Batch fitting -- tree_from/tree_to and the rf_batched_fit_sql helper.
+#
+# Growing only trees [a,b] reproduces exactly those trees of the full forest,
+# so the UNION of batches equals a one-shot fit. Under threads=1 (the fixture)
+# this is EXACT for integer-slot fits (classification, gini/entropy, integer/
+# absent weights): every node sum is an integer, so summation order is
+# irrelevant and every column -- impurity included -- is bit-identical. For
+# fractional-slot fits (regression centers y by a fractional mean) DuckDB's
+# hash aggregate sums the fractional slots in a batch-cardinality-dependent
+# order, so the DISCRETE tree structure is still reproduced exactly (at shallow
+# depth, where no gain is a ~1e-11 near-tie) while the DOUBLE columns agree to
+# float precision -- the same associativity the header documents for threads.
+# ===========================================================================
+
+# every column: bit-identical for integer-slot fits
+_FULL = ("tree,node,depth,is_leaf,split_feature,split_kind,threshold,cats_left,"
+         "cats_right,unseen_left,n_rows,w_node,impurity,imp_decrease,prediction,"
+         "class_counts,family,n_trees,seed,sample_frac,replace_sample,n_train,mtry,"
+         "max_depth,min_samples_split,min_samples_leaf,min_impurity_decrease,"
+         "criterion,features,feature_kinds,classes,train_hash")
+# discrete columns: reproduced exactly even when DOUBLE cols carry float noise
+_DISC = ("tree,node,depth,is_leaf,split_feature,split_kind,cats_left,cats_right,"
+         "unseen_left,n_rows,n_trees,seed,replace_sample,n_train,mtry,max_depth,"
+         "min_samples_split,min_samples_leaf,criterion,features,feature_kinds,"
+         "classes,train_hash")
+
+
+def _col_diff(con, a, b, cols):
+    return df_run(con,
+        f"SELECT (SELECT count(*) FROM (SELECT {cols} FROM {a} EXCEPT SELECT {cols} FROM {b}))"
+        f" + (SELECT count(*) FROM (SELECT {cols} FROM {b} EXCEPT SELECT {cols} FROM {a})) c").c[0]
+
+
+def _batch_union(con, macro, tbl, dst, splits, extra):
+    arms = "\nUNION ALL\n".join(
+        f"SELECT * FROM {macro}('{tbl}','y', tree_from:={a}, tree_to:={b}{extra})"
+        for a, b in splits)
+    con.execute(f"CREATE OR REPLACE TABLE {dst} AS {arms}")
+
+
+class TestBatchFitting:
+    def _clf_data(self, con):
+        # categorical feature + INTEGER weights -> integer slots -> exact
+        con.execute("""CREATE OR REPLACE TABLE bclf AS
+            SELECT i AS x1, (i*13)%20 AS x2, ['a','b','c'][(i%3)+1] AS colour,
+                   (1+(i%3))::BIGINT AS wt,
+                   CASE WHEN (i%10)<6 THEN 'yes' ELSE 'no' END AS y
+            FROM range(240) t(i)""")
+
+    def _reg_data(self, con):
+        con.execute("""CREATE OR REPLACE TABLE breg AS
+            SELECT i AS x1, (i%7)-3 AS x2, 2.0+3.0*i-((i%7)-3) AS y
+            FROM range(200) t(i)""")
+
+    @pytest.mark.parametrize("splits", [
+        [(1, 10), (11, 20), (21, 30)],   # even
+        [(1, 7), (8, 30)],               # uneven
+        [(i, i) for i in range(1, 31)],  # single-tree
+    ])
+    def test_class_union_bit_identical(self, con, splits):
+        self._clf_data(con)
+        e = ", n_trees:=30, max_depth:=6, weights_col:='wt'"
+        con.execute(f"CREATE OR REPLACE TABLE b_one AS SELECT * FROM rf_class_fit('bclf','y'{e})")
+        _batch_union(con, "rf_class_fit", "bclf", "b_bat", splits, e)
+        assert _col_diff(con, "b_one", "b_bat", _FULL) == 0
+
+    def test_class_entropy_and_balanced(self, con):
+        self._clf_data(con)
+        # entropy (integer slots)
+        con.execute("CREATE OR REPLACE TABLE e_one AS SELECT * FROM "
+                    "rf_class_fit('bclf','y', n_trees:=24, max_depth:=6, criterion:='entropy')")
+        _batch_union(con, "rf_class_fit", "bclf", "e_bat", [(1, 11), (12, 24)],
+                     ", n_trees:=24, max_depth:=6, criterion:='entropy'")
+        assert _col_diff(con, "e_one", "e_bat", _FULL) == 0
+        # class_weight='balanced' on BALANCED classes => cw=1.0 => integer slots
+        con.execute("""CREATE OR REPLACE TABLE bbal AS
+            SELECT i AS x1, (i*7)%15 AS x2, CASE WHEN (i%2)=0 THEN 'yes' ELSE 'no' END AS y
+            FROM range(200) t(i)""")
+        con.execute("CREATE OR REPLACE TABLE w_one AS SELECT * FROM "
+                    "rf_class_fit('bbal','y', n_trees:=20, max_depth:=6, class_weight:='balanced')")
+        _batch_union(con, "rf_class_fit", "bbal", "w_bat", [(1, 6), (7, 20)],
+                     ", n_trees:=20, max_depth:=6, class_weight:='balanced'")
+        assert _col_diff(con, "w_one", "w_bat", _FULL) == 0
+
+    @pytest.mark.parametrize("splits", [
+        [(1, 10), (11, 20), (21, 30)],
+        [(1, 7), (8, 30)],
+        [(i, i) for i in range(1, 31)],
+    ])
+    def test_reg_union_structure_and_predictions(self, con, splits):
+        self._reg_data(con)
+        # shallow depth: no near-tied split flips, so discrete structure is exact
+        e = ", n_trees:=30, max_depth:=4"
+        con.execute(f"CREATE OR REPLACE TABLE r_one AS SELECT * FROM rf_reg_fit('breg','y'{e})")
+        _batch_union(con, "rf_reg_fit", "breg", "r_bat", splits, e)
+        assert _col_diff(con, "r_one", "r_bat", _DISC) == 0
+        # DOUBLE columns agree to float precision; predictions match to ~1e-12
+        fl = df_run(con, "SELECT max(abs(x.threshold-y.threshold)) t, "
+                    "max(abs(x.prediction-y.prediction)) p, max(abs(x.impurity-y.impurity)) i "
+                    "FROM r_one x JOIN r_bat y USING (tree,node)")
+        assert (fl.t[0] or 0) <= 1e-9 and (fl.p[0] or 0) <= 1e-9 and fl.i[0] <= 1e-6
+        pd_ = df_run(con, "SELECT max(abs(a.prediction-b.prediction)) d FROM "
+                     "rf_reg_predict('r_one','breg') a JOIN rf_reg_predict('r_bat','breg') b "
+                     "USING (x1)").d[0]
+        assert pd_ <= 1e-9
+
+    def test_metadata_is_total_n_trees(self, con):
+        self._clf_data(con)
+        # each batch carries the TOTAL n_trees and the same train_hash, not the
+        # batch's tree count.
+        for a, b in [(1, 7), (8, 20), (21, 30)]:
+            r = df_run(con, "SELECT DISTINCT n_trees, count(DISTINCT tree) OVER () nt "
+                       f"FROM rf_class_fit('bclf','y', n_trees:=30, max_depth:=5, "
+                       f"tree_from:={a}, tree_to:={b})")
+            assert (r.n_trees == 30).all()          # metadata n_trees == TOTAL
+            assert r.nt[0] == (b - a + 1)            # but only these trees grown
+
+    def test_downstream_parity(self, con):
+        self._clf_data(con)
+        e = ", n_trees:=30, max_depth:=6, weights_col:='wt'"
+        con.execute(f"CREATE OR REPLACE TABLE d_one AS SELECT * FROM rf_class_fit('bclf','y'{e})")
+        _batch_union(con, "rf_class_fit", "bclf", "d_bat", [(1, 11), (12, 30)], e)
+        # bit-identical model => identical predictions, importance and OOB
+        pp = df_run(con, "SELECT max(abs(a.p-b.p)) d FROM "
+                    "(SELECT x1, probs['yes'] p FROM rf_class_predict('d_one','bclf')) a JOIN "
+                    "(SELECT x1, probs['yes'] p FROM rf_class_predict('d_bat','bclf')) b USING (x1)").d[0]
+        assert pp == 0.0
+        imp = df_run(con, "SELECT max(abs(a.importance-b.importance)) d FROM "
+                     "rf_importance('d_one') a JOIN rf_importance('d_bat') b USING (feature)").d[0]
+        assert imp == 0.0
+        oa = df_run(con, "SELECT accuracy a FROM rf_class_oob('d_one','bclf','y')").a[0]
+        ob = df_run(con, "SELECT accuracy a FROM rf_class_oob('d_bat','bclf','y')").a[0]
+        assert oa == ob
+
+    def test_helper_roundtrip_classification(self, con):
+        # balanced classes so class_weight='balanced' resolves to cw=1.0 (exact);
+        # batch_size (7) does NOT divide n_trees (25)
+        con.execute("""CREATE OR REPLACE TABLE hbal AS
+            SELECT i AS x1, (i*7)%15 AS x2, CASE WHEN (i%2)=0 THEN 'yes' ELSE 'no' END AS y
+            FROM range(200) t(i)""")
+        sql = df_run(con, "SELECT rf_batched_fit_sql('hbal','y','classification', "
+                     "n_trees:=25, batch_size:=7, max_depth:=6, class_weight:='balanced') s").s[0]
+        assert sql.count("UNION ALL") == 3               # ceil(25/7) = 4 arms
+        assert "tree_from := 22, tree_to := 25" in sql
+        assert "class_weight := 'balanced'" in sql
+        con.execute(f"CREATE OR REPLACE TABLE hc_bat AS {sql}")
+        con.execute("CREATE OR REPLACE TABLE hc_one AS SELECT * FROM "
+                    "rf_class_fit('hbal','y', n_trees:=25, max_depth:=6, class_weight:='balanced')")
+        assert _col_diff(con, "hc_one", "hc_bat", _FULL) == 0
+
+    def test_helper_roundtrip_regression(self, con):
+        self._reg_data(con)
+        sql = df_run(con, "SELECT rf_batched_fit_sql('breg','y','regression', "
+                     "n_trees:=25, batch_size:=10, max_depth:=4) s").s[0]
+        assert "class_weight" not in sql                 # regression omits it
+        con.execute(f"CREATE OR REPLACE TABLE hr_bat AS {sql}")
+        con.execute("CREATE OR REPLACE TABLE hr_one AS SELECT * FROM "
+                    "rf_reg_fit('breg','y', n_trees:=25, max_depth:=4)")
+        assert _col_diff(con, "hr_one", "hr_bat", _DISC) == 0
+
+    def test_lone_null_takes_default(self, con):
+        self._reg_data(con)
+        # tree_to NULL defaults to n_trees; tree_from NULL defaults to 1
+        r = df_run(con, "SELECT min(tree) lo, max(tree) hi, count(DISTINCT tree) n FROM "
+                   "rf_reg_fit('breg','y', n_trees:=8, max_depth:=4, tree_from:=3)")
+        assert (r.lo[0], r.hi[0], r.n[0]) == (3, 8, 6)
+
+    def test_validation_errors(self, con):
+        self._reg_data(con)
+        for tf, tt in [(0, 5), (6, 3), (8, 12)]:
+            with pytest.raises(DuckDBError, match="1 <= tree_from <= tree_to <= n_trees"):
+                df_run(con, f"SELECT * FROM rf_reg_fit('breg','y', n_trees:=10, "
+                            f"tree_from:={tf}, tree_to:={tt})")
+        with pytest.raises(DuckDBError, match="family must be"):
+            df_run(con, "SELECT rf_batched_fit_sql('breg','y','bogus', n_trees:=10)")
+        with pytest.raises(DuckDBError, match="batch_size must be >= 1"):
+            df_run(con, "SELECT rf_batched_fit_sql('breg','y','regression', n_trees:=10, batch_size:=0)")
+        with pytest.raises(DuckDBError, match="n_trees must be >= 1"):
+            df_run(con, "SELECT rf_batched_fit_sql('breg','y','regression', n_trees:=0)")

@@ -536,6 +536,92 @@ with `k · |grid| · trees · features · rows · depth`, so keep the grid modes
 `rf_cv` bags with the same bootstrap as `*_fit` (`sample_frac` of each fold's
 training rows, with replacement) and uses `'gini'` / `'mse'`.
 
+## Scaling to large forests (batch fitting)
+
+The whole forest is grown in **one recursive CTE over all trees at once**, so peak
+memory grows with `n_trees × max_depth`: each recursion level holds a frontier of
+`≈ n_trees × n` `(tree, row)` assignments plus the model rows accumulated so far.
+As a rough figure, a depth-20 forest on 50k × 20 data runs on the order of
+~1–1.5 GB **per tree** — a few hundred trees can exhaust memory.
+
+**Batch the fit.** `rf_class_fit` / `rf_reg_fit` take `tree_from` / `tree_to`
+(both default `NULL` = every tree). They grow only the trees whose **global**
+index is in `[tree_from, tree_to]`; `n_trees` stays the **total** forest size and
+still drives the metadata, the RNG and OOB replay. Because every tree is grown
+independently and all per-tree randomness keys on the global tree index, the
+`UNION ALL` of the batches reproduces the one-shot fit:
+
+```sql
+CREATE TABLE m AS
+      SELECT * FROM rf_reg_fit('big', 'y', n_trees := 300, max_depth := 18, tree_from := 1,   tree_to := 100)
+  UNION ALL
+      SELECT * FROM rf_reg_fit('big', 'y', n_trees := 300, max_depth := 18, tree_from := 101, tree_to := 200)
+  UNION ALL
+      SELECT * FROM rf_reg_fit('big', 'y', n_trees := 300, max_depth := 18, tree_from := 201, tree_to := 300);
+```
+
+Each arm's recursion is bounded to 100 trees, so peak memory is roughly a third of
+the one-shot fit while the resulting `m` is the same 300-tree model. For an even
+smaller envelope, fit the arms **sequentially** into one table (`CREATE TABLE m AS
+<arm1>; INSERT INTO m <arm2>; …`) so only one batch is in flight at a time; the
+arms are fully independent, so a driver can also fit them on **parallel
+connections** and `UNION` the tables. Require `1 ≤ tree_from ≤ tree_to ≤ n_trees`
+(a lone `NULL` takes its default of `1` / `n_trees`).
+
+### `rf_batched_fit_sql` — write the batched UNION for you
+
+`rf_batched_fit_sql(tbl, outcome, family, n_trees := 100, batch_size := 10, …)`
+returns the `SELECT … UNION ALL SELECT …` **as text**, one arm per `batch_size`
+trees. `family` (`'classification'` | `'regression'`) picks the fit macro,
+`criterion := NULL` emits the family default, and `class_weight` is emitted only
+for classification. Like duckLM's `dummy_encode_sql`, a macro can't grow a
+data-dependent number of arms, so you **fetch the text and run it as a second
+statement** (`query()` takes only a constant literal, so there is no inline form):
+
+```python
+# Python / R / any driver — two lines:
+sql = con.sql("SELECT rf_batched_fit_sql('big','y','regression', "
+              "n_trees:=300, batch_size:=50, max_depth:=18)").fetchone()[0]
+con.sql(f"CREATE TABLE m AS {sql}")
+```
+
+Use **smaller batches for larger or deeper data**. `batch_size` need not divide
+`n_trees` — batch *i* covers `[(i-1)·batch_size + 1, min(i·batch_size, n_trees)]`.
+
+### Is the batched model *identical* to a one-shot fit?
+
+In exact arithmetic, yes — bit for bit. In practice it depends on whether a node's
+weight sums are integers, because DuckDB's hash aggregate sums them in an order
+that depends on how many trees share the arm (the same float-associativity
+described under [Reproducibility](#reproducibility) for threads):
+
+* **Integer-slot fits** — classification with `'gini'`/`'entropy'`, no
+  `class_weight` (or one that resolves to `1.0`), and integer/absent `weights_col`
+  — sum exactly. The batched model is **bit-identical on every column**, `impurity`
+  included, under `PRAGMA threads=1`.
+* **Fractional-slot fits** — regression (the outcome is centered by a fractional
+  mean), a fractional `weights_col`, or `class_weight := 'balanced'` on imbalanced
+  classes — carry ~1e-11 noise in the slot sums, because DuckDB's `GROUP BY
+  (tree, node)` sums a node's values in an order that depends on how many trees
+  share the arm. At **shallow depth** the gains are well separated, so the **tree
+  structure** (split feature, direction, routing, `n_rows`) is still reproduced
+  exactly and only the `DOUBLE` columns (`threshold`, `prediction`, `impurity`,
+  `imp_decrease`) move — they agree to ~1e-9 rather than bit-for-bit. But this is
+  **not** a whole-forest guarantee: once you grow deep, near-tied gains appear and
+  a flipped split cascades into different sub-trees. At the library's **default
+  `max_depth := 20`** a batched regression forest diverges *structurally* from the
+  one-shot fit — hundreds of nodes differ and forest predictions can differ by
+  **~0.05–0.15** (measured: 400 trees × depth 20, n = 400). The batch grows a
+  *different but statistically equivalent* forest — metadata is unchanged, OOB
+  accuracy tracks closely — exactly the way two **multi-threaded** one-shot fits
+  of the same data diverge. **Do not** rely on cell-for-cell equality of a batched
+  vs one-shot regression / balanced-imbalanced model; rely on statistical
+  equivalence.
+
+Fit under `PRAGMA threads=1` for the strongest guarantee. Bit-identity of the
+batched UNION holds **only** for integer-slot fits; for fractional-slot fits it is
+statistical equivalence, not bit-for-bit reproduction.
+
 ## Contract & fine print
 
 ### Reproducibility

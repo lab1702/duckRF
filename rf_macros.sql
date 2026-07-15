@@ -11,6 +11,13 @@
 -- Public macros (this file -- fitting):
 --   rf_class_fit(tbl, outcome, ...)  -> forest model table (see below)
 --   rf_reg_fit(tbl, outcome, ...)    -> forest model table (see below)
+--   rf_batched_fit_sql(tbl, outcome, family, ...) -> VARCHAR: the batched
+--       UNION-ALL fit as SQL text, for growing a large forest in memory-bounded
+--       batches. For integer-slot fits (classification, no fractional weights)
+--       the UNION is bit-identical to a one-shot fit; for fractional-slot fits
+--       (regression, fractional weights_col, class_weight:='balanced' on
+--       imbalanced classes) it is a statistically-equivalent forest, NOT bit-
+--       identical -- see the caveat at tree_from/tree_to below (see below).
 --
 --   NOTE on naming: the two families are rf_class_* / rf_reg_*, not rfc_* /
 --   rfr_*. Both families accept the same argument list and the same outcome
@@ -67,6 +74,31 @@
 --                                   (sklearn's sample_weight)
 --   class_weight          := NULL   classification only; 'balanced' multiplies
 --                                   each row's weight by n / (K * n_k)
+--   tree_from             := NULL   batch fitting: grow only trees whose GLOBAL
+--   tree_to               := NULL   index is in [tree_from, tree_to] (both NULL
+--                                   = every tree 1..n_trees, unchanged). n_trees
+--                                   stays the TOTAL forest size (drives metadata,
+--                                   RNG and OOB replay); the emitted tree column
+--                                   and all per-tree randomness key on the global
+--                                   index, so a batch reproduces EXACTLY those
+--                                   trees. Under threads=1 the UNION of batches is
+--                                   bit-identical to a one-shot fit for INTEGER-
+--                                   slot fits (classification without fractional/
+--                                   balanced weights). For FRACTIONAL-slot fits
+--                                   (regression; a fractional weights_col;
+--                                   class_weight:='balanced' on imbalanced
+--                                   classes) DuckDB's GROUP BY sums a node's slot
+--                                   values in an order that depends on how many
+--                                   trees share the arm, so the low bits move by
+--                                   ~1e-11; a near-tied split can then flip and
+--                                   the batched forest, though statistically
+--                                   equivalent (metadata identical), is NOT bit-
+--                                   identical -- at the default max_depth:=20 the
+--                                   forests diverge structurally and predictions
+--                                   can differ by ~0.05-0.15 (same float-
+--                                   associativity class as multithreaded fits).
+--                                   Require 1 <= tree_from <= tree_to <= n_trees.
+--                                   rf_batched_fit_sql writes the UNION for you.
 --
 -- Requirements / behavior:
 --   * Feature columns must be numeric (any int/uint width, FLOAT, DOUBLE,
@@ -231,7 +263,7 @@ CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
 CREATE OR REPLACE MACRO __rf_fit(tbl, outcome, family, caller, n_trees, mtry, max_depth,
                                  min_samples_split, min_samples_leaf, min_impurity_decrease,
                                  sample_frac, replace_sample, criterion, seed,
-                                 weights_col, class_weight) AS TABLE
+                                 weights_col, class_weight, tree_from, tree_to) AS TABLE
 WITH RECURSIVE
 -- Column types. DESCRIBE does not bind query_table() inside a macro; this
 -- LEFT JOIN onto a constant row does, keeps column names AND order, and on an
@@ -409,6 +441,16 @@ __rf_chk AS (
                THEN error(caller || ': class_weight must be NULL or ''balanced'', got ''' || class_weight || '''')
              WHEN seed IS NULL
                THEN error(caller || ': seed must not be NULL (the forest is deterministic in it)')
+             -- Batch tree-range. tree_from/tree_to default to 1 / n_trees (a lone
+             -- NULL takes its default); the effective window must satisfy
+             -- 1 <= tree_from <= tree_to <= n_trees so a batch names only trees
+             -- that exist in the full forest.
+             WHEN coalesce(tree_from, 1) > coalesce(tree_to, n_trees)
+                  OR coalesce(tree_from, 1) < 1
+                  OR coalesce(tree_to, n_trees) > n_trees
+               THEN error(caller || ': tree_from/tree_to must satisfy 1 <= tree_from <= tree_to <= n_trees (n_trees='
+                          || n_trees || '), got tree_from=' || coalesce(tree_from, 1)
+                          || ', tree_to=' || coalesce(tree_to, n_trees))
              ELSE true
            END AS ok
 ),
@@ -505,7 +547,22 @@ __rf_feat AS MATERIALIZED (
 --   otherwise: rank rows by md5_number(seed:tree:i) and take the first m.
 -- The result is a WEIGHTED row set (tree, rid, cnt), never a materialized
 -- resample. cnt is multiplied by the row's sample weight.
-__rf_trees AS (SELECT unnest(range(1, n_trees + 1))::INTEGER AS tree),
+-- Tree enumerator. Growing only the global-index range [tree_from, tree_to]
+-- (defaulting to the full 1..n_trees) is the SINGLE functional change that
+-- enables batch fitting: every tree is grown independently and all per-tree RNG
+-- keys on the GLOBAL tree index (bootstrap md5_number(seed:tree:kk), mtry
+-- md5_number(seed:tree:node:col)), so a batch reproduces EXACTLY those trees of
+-- the full forest. Under threads=1 the UNION of batches is bit-identical to a
+-- one-shot fit for INTEGER-slot fits (classification without fractional/balanced
+-- weights); for FRACTIONAL-slot fits (regression, fractional weights_col,
+-- class_weight:='balanced' on imbalanced classes) the node slot sums are combined
+-- by DuckDB's GROUP BY in a tree-count-dependent order, so the low bits move and a
+-- near-tied split can flip -- the batched forest is statistically equivalent but
+-- NOT bit-identical (see the header note at tree_from/tree_to).
+-- The emitted tree column carries the global index; n_trees stays the TOTAL
+-- forest size (metadata, RNG, OOB replay all use it), never the batch count.
+__rf_trees AS (SELECT unnest(range(coalesce(tree_from, 1),
+                                   coalesce(tree_to, n_trees) + 1))::INTEGER AS tree),
 __rf_m AS (SELECT greatest(1, ceil(sample_frac * (SELECT n FROM __rf_n)))::BIGINT AS m),
 __rf_boot AS MATERIALIZED (
     SELECT t.tree, d.rid, count(*)::DOUBLE * any_value(rw.rw) AS w
@@ -864,23 +921,128 @@ ORDER BY t.tree, t.node;
 -- Public fit wrappers
 -- ---------------------------------------------------------------------------
 
+-- tree_from/tree_to (both default NULL = grow every tree 1..n_trees) grow only
+-- the trees whose GLOBAL index is in [tree_from, tree_to]. n_trees is always the
+-- TOTAL forest size; a batch's emitted tree column and RNG use the global index,
+-- so UNION ALL of the batches equals a one-shot fit bit-for-bit for integer-slot
+-- fits (classification without fractional/balanced weights); for fractional-slot
+-- fits (regression, fractional weights_col, class_weight:='balanced' on
+-- imbalanced classes) it is a statistically-equivalent but not bit-identical
+-- forest (float-associativity; see the header note at tree_from/tree_to). See
+-- rf_batched_fit_sql for a helper that writes the batched UNION for you.
 CREATE OR REPLACE MACRO rf_class_fit(tbl, outcome, n_trees := 100, mtry := NULL, max_depth := 20,
                                      min_samples_split := 2, min_samples_leaf := 1,
                                      min_impurity_decrease := 0.0, sample_frac := 1.0,
                                      replace_sample := true, criterion := 'gini', seed := 42,
-                                     weights_col := NULL, class_weight := NULL) AS TABLE
+                                     weights_col := NULL, class_weight := NULL,
+                                     tree_from := NULL, tree_to := NULL) AS TABLE
 SELECT * FROM __rf_fit(tbl, outcome, 'classification', 'rf_class_fit', n_trees, mtry, max_depth,
                        min_samples_split, min_samples_leaf, min_impurity_decrease,
-                       sample_frac, replace_sample, criterion, seed, weights_col, class_weight);
+                       sample_frac, replace_sample, criterion, seed, weights_col, class_weight,
+                       tree_from, tree_to);
 
 CREATE OR REPLACE MACRO rf_reg_fit(tbl, outcome, n_trees := 100, mtry := NULL, max_depth := 20,
                                    min_samples_split := 2, min_samples_leaf := 1,
                                    min_impurity_decrease := 0.0, sample_frac := 1.0,
                                    replace_sample := true, criterion := 'mse', seed := 42,
-                                   weights_col := NULL) AS TABLE
+                                   weights_col := NULL, tree_from := NULL, tree_to := NULL) AS TABLE
 SELECT * FROM __rf_fit(tbl, outcome, 'regression', 'rf_reg_fit', n_trees, mtry, max_depth,
                        min_samples_split, min_samples_leaf, min_impurity_decrease,
-                       sample_frac, replace_sample, criterion, seed, weights_col, NULL);
+                       sample_frac, replace_sample, criterion, seed, weights_col, NULL,
+                       tree_from, tree_to);
+
+
+-- ---------------------------------------------------------------------------
+-- rf_batched_fit_sql -- bounded-memory forest fitting (returns SQL text).
+--
+-- Fitting is ONE recursive CTE over ALL trees at once, so peak memory grows
+-- with n_trees * max_depth. For a large/deep forest that envelope can be split:
+-- grow the forest in batches of `batch_size` trees and UNION the results. Every
+-- tree is grown independently and all per-tree randomness keys on the GLOBAL
+-- tree index, so the UNION of batches reproduces the same trees as a one-shot fit
+-- of the same n_trees/seed. Under PRAGMA threads=1 that UNION is bit-identical for
+-- INTEGER-slot fits (classification without fractional/balanced weights); for
+-- fractional-slot fits (regression, a fractional weights_col, or class_weight :=
+-- 'balanced' on imbalanced classes) it is a statistically-equivalent but NOT
+-- bit-identical forest -- see the tree_from/tree_to note in the header.
+--
+-- Like duckLM's dummy_encode_sql, a DuckDB macro cannot itself grow-then-UNION a
+-- data-dependent number of arms, so this RETURNS the "SELECT ... UNION ALL
+-- SELECT ..." as TEXT; fetch it and run it as a SECOND statement. (query() takes
+-- only a constant literal -- FROM query((SELECT rf_batched_fit_sql(...))) raises
+-- "Table function cannot contain subqueries" -- so there is no inline form; run
+-- the text directly, exactly as duckLM runs dummy_encode_sql's output.)
+--
+--   -- from a Python / R / etc. driver, two lines:
+--   sql = con.sql("SELECT rf_batched_fit_sql('bigtbl','y','regression', n_trees:=200, batch_size:=20)").fetchone()[0]
+--   con.sql(f"CREATE TABLE m AS {sql}")
+--
+--   -- DuckDB CLI: capture the text, then read it back as a statement, e.g.
+--   COPY (SELECT rf_batched_fit_sql('bigtbl','y','regression', n_trees:=200)) TO 'fit.sql' (FORMAT csv, HEADER false, QUOTE '');
+--   CREATE TABLE m AS <paste/`.read fit.sql` the returned SELECT>;
+--
+-- family in ('classification','regression') selects rf_class_fit / rf_reg_fit.
+-- criterion := NULL emits the family default ('gini' / 'mse'). class_weight is
+-- emitted ONLY for classification (rf_reg_fit has no such parameter). All string
+-- arguments are quoted with quote_literal; NULLs become the literal NULL and
+-- booleans true/false. Batch i covers global trees
+-- [(i-1)*batch_size + 1, least(i*batch_size, n_trees)].
+-- ---------------------------------------------------------------------------
+-- Emit a value as a single-quoted SQL string literal, doubling embedded quotes
+-- (DuckDB has no quote_literal()). NULL in -> NULL out, so callers wrap optional
+-- string args as coalesce(__rf_quote(x), 'NULL').
+CREATE OR REPLACE MACRO __rf_quote(s) AS (
+    CASE WHEN s IS NULL THEN NULL ELSE '''' || replace(s, '''', '''''') || '''' END
+);
+
+CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100, batch_size := 10,
+                                           mtry := NULL, max_depth := 20, min_samples_split := 2,
+                                           min_samples_leaf := 1, min_impurity_decrease := 0.0,
+                                           sample_frac := 1.0, replace_sample := true,
+                                           criterion := NULL, seed := 42, weights_col := NULL,
+                                           class_weight := NULL) AS (
+  WITH __rf_bcfg AS (
+    SELECT CASE WHEN family = 'classification' THEN 'rf_class_fit' ELSE 'rf_reg_fit' END AS fitmacro,
+           coalesce(criterion, CASE WHEN family = 'classification' THEN 'gini' ELSE 'mse' END) AS crit
+  ),
+  __rf_barms AS (
+    SELECT string_agg(
+             'SELECT * FROM ' || (SELECT fitmacro FROM __rf_bcfg) || '('
+             || __rf_quote(tbl) || ', ' || __rf_quote(outcome)
+             || ', n_trees := ' || n_trees
+             || ', tree_from := ' || ((g.i - 1) * batch_size + 1)
+             || ', tree_to := ' || least(g.i * batch_size, n_trees)
+             || ', mtry := ' || coalesce(mtry::VARCHAR, 'NULL')
+             || ', max_depth := ' || coalesce(max_depth::VARCHAR, 'NULL')
+             || ', min_samples_split := ' || min_samples_split
+             || ', min_samples_leaf := ' || min_samples_leaf
+             || ', min_impurity_decrease := ' || min_impurity_decrease
+             || ', sample_frac := ' || sample_frac
+             || ', replace_sample := ' || CASE WHEN replace_sample THEN 'true' ELSE 'false' END
+             || ', criterion := ' || __rf_quote((SELECT crit FROM __rf_bcfg))
+             || ', seed := ' || seed
+             || ', weights_col := ' || coalesce(__rf_quote(weights_col), 'NULL')
+             || CASE WHEN family = 'classification'
+                     THEN ', class_weight := ' || coalesce(__rf_quote(class_weight), 'NULL')
+                     ELSE '' END
+             || ')',
+             chr(10) || 'UNION ALL' || chr(10) ORDER BY g.i) AS arms
+    -- greatest(batch_size, 1) keeps the arm count finite even for an invalid
+    -- batch_size (n_trees / 0 would be +inf and overflow the CAST); the guard in
+    -- the final SELECT still returns the batch_size < 1 error to the caller.
+    FROM range(1, CAST(ceil(n_trees::DOUBLE / greatest(batch_size, 1)) AS BIGINT) + 1) g(i)
+  )
+  SELECT CASE
+           WHEN family NOT IN ('classification', 'regression')
+             THEN error('rf_batched_fit_sql: family must be ''classification'' or ''regression'', got '''
+                        || coalesce(family, 'NULL') || '''')
+           WHEN n_trees < 1
+             THEN error('rf_batched_fit_sql: n_trees must be >= 1, got ' || n_trees)
+           WHEN batch_size < 1
+             THEN error('rf_batched_fit_sql: batch_size must be >= 1, got ' || batch_size)
+           ELSE (SELECT arms FROM __rf_barms)
+         END
+);
 
 
 -- ###########################################################################

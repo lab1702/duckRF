@@ -34,7 +34,7 @@
 --   __rf_fit(tbl, outcome, family, caller, n_trees, mtry, max_depth,
 --            min_samples_split, min_samples_leaf, min_impurity_decrease,
 --            sample_frac, replace_sample, criterion, seed, weights_col,
---            class_weight)
+--            class_weight, tree_from, tree_to, splitter)
 --
 -- Fit parameters (identical for both families):
 --   n_trees               := 100    number of trees
@@ -74,6 +74,26 @@
 --                                   (sklearn's sample_weight)
 --   class_weight          := NULL   classification only; 'balanced' multiplies
 --                                   each row's weight by n / (K * n_k)
+--   splitter              := 'best' 'best' = Random Forest (search each candidate
+--                                   feature for its BEST split, today's behavior,
+--                                   unchanged). 'random' = EXTRA TREES: draw ONE
+--                                   random split per candidate feature -- a numeric
+--                                   threshold uniform in the node's [min,max), or a
+--                                   per-level coin-flip subset for a categorical --
+--                                   and keep the feature whose random split has the
+--                                   best gain. The mtry lottery, bootstrap, gain
+--                                   algebra and pruning are identical; only split
+--                                   SELECTION changes, so predict / evaluate / OOB /
+--                                   rf_importance / rf_reg_quantile / batch fitting
+--                                   all work on an ET model unchanged. splitter is
+--                                   orthogonal to bootstrap: textbook Extra Trees is
+--                                   splitter:='random', replace_sample:=false,
+--                                   sample_frac:=1.0 (matches sklearn ExtraTrees*,
+--                                   bootstrap=False; mtry defaults already match its
+--                                   max_features sqrt/all). All draws stay
+--                                   md5_number-deterministic in seed. The categorical
+--                                   coin-flip subset is duckRF's own definition (no
+--                                   sklearn reference, as for RF categorical splits).
 --   tree_from             := NULL   batch fitting: grow only trees whose GLOBAL
 --   tree_to               := NULL   index is in [tree_from, tree_to] (both NULL
 --                                   = every tree 1..n_trees, unchanged). n_trees
@@ -185,6 +205,7 @@
 --   min_samples_leaf      INTEGER
 --   min_impurity_decrease DOUBLE
 --   criterion             VARCHAR
+--   splitter              VARCHAR   'best' (Random Forest) | 'random' (Extra Trees)
 --   features              VARCHAR[] every feature column, in name order
 --   feature_kinds         VARCHAR[] 'num' | 'cat', aligned with features
 --   classes               VARCHAR[] sorted class labels (NULL for regression)
@@ -263,7 +284,7 @@ CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
 CREATE OR REPLACE MACRO __rf_fit(tbl, outcome, family, caller, n_trees, mtry, max_depth,
                                  min_samples_split, min_samples_leaf, min_impurity_decrease,
                                  sample_frac, replace_sample, criterion, seed,
-                                 weights_col, class_weight, tree_from, tree_to) AS TABLE
+                                 weights_col, class_weight, tree_from, tree_to, splitter) AS TABLE
 WITH RECURSIVE
 -- Column types. DESCRIBE does not bind query_table() inside a macro; this
 -- LEFT JOIN onto a constant row does, keeps column names AND order, and on an
@@ -451,6 +472,10 @@ __rf_chk AS (
                THEN error(caller || ': tree_from/tree_to must satisfy 1 <= tree_from <= tree_to <= n_trees (n_trees='
                           || n_trees || '), got tree_from=' || coalesce(tree_from, 1)
                           || ', tree_to=' || coalesce(tree_to, n_trees))
+             -- Extra Trees switch: 'best' is the RF best-split search (default,
+             -- unchanged); 'random' draws ONE random split per candidate feature.
+             WHEN splitter IS NULL OR splitter NOT IN ('best', 'random')
+               THEN error(caller || ': splitter must be ''best'' or ''random'', got ''' || coalesce(splitter, 'NULL') || '''')
              ELSE true
            END AS ok
 ),
@@ -694,6 +719,7 @@ __rf_tr AS (
                CASE WHEN kind = 'num' THEN CAST(v AS VARCHAR) ELSE lv END AS bucket,
                any_value(v) AS bnum, count(*) AS bn
         FROM cf
+        WHERE splitter = 'best'   -- best-split path only; 'random' feeds rbestdef below
         GROUP BY tree, node, col, kind, bucket
      ),
      bslot AS (
@@ -824,6 +850,113 @@ __rf_tr AS (
                         AND p.col = b.col AND p.ord = b.ord
         GROUP BY b.tree, b.node, b.depth, b.col, b.kind, b.thr, b.gain, b.nrows, b.wn,
                  b.imp, b.pvec, b.wl, b.skey, b.bucket
+     ),
+     -- =====================================================================
+     -- EXTRA TREES ('random' splitter): draw ONE random split per candidate
+     -- feature (the mtry lottery `mt`/`cf` is shared and UNCHANGED), score it
+     -- with the same __rf_q/__rf_wt algebra, pick the feature whose random
+     -- split has the best gain, and emit a bestdef-shaped row. Gated on
+     -- splitter='random' so it is empty (and the whole best path above is empty
+     -- via `bcnt`'s splitter='best' filter) on the other setting.
+     -- =====================================================================
+     cfr AS (SELECT * FROM cf WHERE splitter = 'random'),
+     -- Numeric feature range in the node (non-constant is guaranteed by the mt
+     -- lottery's `nonconst`, so hi > lo) and the ONE uniform threshold drawn in
+     -- [lo, hi): thr = lo + u*(hi-lo), u in [0,1) from a 2^53 md5 draw.
+     rlohi AS (
+        SELECT tree, node, col, min(v) AS lo, max(v) AS hi
+        FROM cfr WHERE kind = 'num'
+        GROUP BY tree, node, col
+     ),
+     rthr AS (
+        SELECT tree, node, col, lo, hi,
+               lo + ((md5_number(seed || ':RT:' || tree || ':' || node || ':' || col)
+                      % 9007199254740992::UHUGEINT)::DOUBLE / 9007199254740992.0) * (hi - lo) AS thr
+        FROM rlohi
+     ),
+     -- Which side each node row is routed to by the random split.
+     --   numeric     LEFT iff v <= thr
+     --   categorical LEFT iff md5_number(seed:RC:tree:node:col:level) % 2 = 0
+     rmemb AS (
+        SELECT cf.tree, cf.node, cf.col, cf.kind, cf.rid, cf.w, cf.lv,
+               CASE WHEN cf.kind = 'num' THEN (cf.v <= rt.thr)
+                    ELSE (md5_number(seed || ':RC:' || cf.tree || ':' || cf.node || ':' || cf.col || ':' || cf.lv)
+                          % 2::UHUGEINT = 0) END AS goleft
+        FROM cfr cf
+        LEFT JOIN rthr rt ON rt.tree = cf.tree AND rt.node = cf.node AND rt.col = cf.col AND cf.kind = 'num'
+     ),
+     -- Left slot sums (sparse) and left row-count / weight, per candidate feature.
+     rlslot AS (
+        SELECT m.tree, m.node, m.col, u.slot, sum(m.w * u.u) AS s
+        FROM rmemb m JOIN __rf_u u ON u.rid = m.rid
+        WHERE m.goleft
+        GROUP BY m.tree, m.node, m.col, u.slot
+     ),
+     rcnt AS (
+        SELECT tree, node, col, count(*) FILTER (goleft) AS nl
+        FROM rmemb GROUP BY tree, node, col
+     ),
+     -- Densify the left slot vector against the full slot list (a slot absent
+     -- from the left child must still hold its position, as in `nvec`).
+     rlvec AS (
+        SELECT g.tree, g.node, g.col, list(coalesce(x.s, 0.0) ORDER BY g.slot) AS lvec
+        FROM (SELECT c.tree, c.node, c.col, k.slot
+              FROM (SELECT DISTINCT tree, node, col FROM rmemb) c CROSS JOIN __rf_slots k) g
+        LEFT JOIN rlslot x ON x.tree = g.tree AND x.node = g.node AND x.col = g.col AND x.slot = g.slot
+        GROUP BY g.tree, g.node, g.col
+     ),
+     -- rvec = parent - left, materialized as a column before __rf_q touches it
+     -- (no nested lambdas in a lambda body -- same reason as `cvec`).
+     rcand AS (
+        SELECT lv.tree, lv.node, lv.col, f.kind,
+               s.depth, s.nrows, s.wn, s.pvec, s.imp, s.qpar, wr.w_root, lv.lvec, rc.nl,
+               list_transform(lv.lvec, lambda x, j: s.pvec[j] - x) AS rvec
+        FROM rlvec lv
+        JOIN sn s ON s.tree = lv.tree AND s.node = lv.node
+        JOIN rcnt rc ON rc.tree = lv.tree AND rc.node = lv.node AND rc.col = lv.col
+        JOIN __rf_featcols f ON f.col = lv.col
+        JOIN __rf_wroot wr ON wr.tree = lv.tree
+     ),
+     rscored AS (
+        SELECT c.*,
+               __rf_q(c.lvec, criterion) + __rf_q(c.rvec, criterion) - c.qpar AS gain,
+               __rf_wt(c.lvec, criterion) AS wl
+        FROM rcand c
+     ),
+     -- Same acceptance test and argmax as `best`, over ONE candidate per feature.
+     -- The min_samples_leaf bounds also reject a categorical draw that put ALL
+     -- levels on one side (that child has 0 rows), exactly the trivial-split
+     -- rejection the spec calls for.
+     rbest AS (
+        SELECT * FROM rscored
+        WHERE isfinite(gain)
+          AND gain / w_root + 2.220446049250313e-16 >= min_impurity_decrease
+          AND nl >= min_samples_leaf
+          AND nrows - nl >= min_samples_leaf
+        QUALIFY row_number() OVER (PARTITION BY tree, node ORDER BY gain DESC, col) = 1
+     ),
+     -- Per-level side of the winning categorical split, for cats_left/cats_right.
+     rcatside AS (
+        SELECT DISTINCT tree, node, col, lv, goleft FROM rmemb WHERE kind = 'cat'
+     ),
+     rbestdef AS (
+        SELECT b.tree, b.node, b.depth, b.col, b.kind,
+               CASE WHEN b.kind = 'num' THEN any_value(rt.thr) END AS thr,
+               b.gain, b.nrows, b.wn, b.imp, b.pvec, b.wl, b.wn - b.wl AS wr,
+               CASE WHEN b.kind = 'cat' THEN list(cs.lv ORDER BY cs.lv) FILTER (cs.goleft) END AS cats_left,
+               CASE WHEN b.kind = 'cat' THEN list(cs.lv ORDER BY cs.lv) FILTER (NOT cs.goleft) END AS cats_right
+        FROM rbest b
+        LEFT JOIN rthr rt ON rt.tree = b.tree AND rt.node = b.node AND rt.col = b.col AND b.kind = 'num'
+        LEFT JOIN rcatside cs ON cs.tree = b.tree AND cs.node = b.node AND cs.col = b.col AND b.kind = 'cat'
+        GROUP BY b.tree, b.node, b.depth, b.col, b.kind, b.gain, b.nrows, b.wn, b.imp, b.pvec, b.wl
+     ),
+     -- Convergence point: both splitters produce the same shape. Exactly one of
+     -- the two is non-empty per fit, so on splitter='best' alldef = bestdef
+     -- byte-for-byte (rbestdef is empty), and the emit code below is untouched.
+     alldef AS (
+        SELECT * FROM bestdef
+        UNION ALL
+        SELECT * FROM rbestdef
      )
      -- internal (split) nodes
      SELECT 'split', d.tree, d.node, d.depth, NULL::BIGINT, NULL::DOUBLE,
@@ -840,7 +973,7 @@ __rf_tr AS (
               imp_decrease  := d.gain,
               prediction    := NULL::DOUBLE,
               class_counts  := NULL::MAP(VARCHAR, DOUBLE))
-     FROM bestdef d
+     FROM alldef d
      UNION ALL
      -- leaves: every current node with no admissible split. class_counts is
      -- DENSE over the training classes (zeros included) so that predict can
@@ -865,7 +998,7 @@ __rf_tr AS (
                                            (SELECT classes FROM __rf_classlist),
                                            lambda c, j: struct_pack(key := c, value := s.pvec[j]))) END)
      FROM nstat s
-     WHERE NOT EXISTS (SELECT 1 FROM bestdef d WHERE d.tree = s.tree AND d.node = s.node)
+     WHERE NOT EXISTS (SELECT 1 FROM alldef d WHERE d.tree = s.tree AND d.node = s.node)
      UNION ALL
      -- the next frontier
      SELECT 'assign', c.tree,
@@ -875,7 +1008,7 @@ __rf_tr AS (
                          END,
             c.depth + 1, c.rid, c.w, NULL
      FROM cur c
-     JOIN bestdef d ON d.tree = c.tree AND d.node = c.node
+     JOIN alldef d ON d.tree = c.tree AND d.node = c.node
      JOIN __rf_feat f ON f.rid = c.rid AND f.col = d.col
     )
 )
@@ -907,6 +1040,7 @@ SELECT t.tree,
        min_samples_leaf::INTEGER                    AS min_samples_leaf,
        min_impurity_decrease::DOUBLE                AS min_impurity_decrease,
        criterion                                    AS criterion,
+       splitter                                     AS splitter,
        (SELECT list(col ORDER BY j) FROM __rf_featcols)   AS features,
        (SELECT list(kind ORDER BY j) FROM __rf_featcols)  AS feature_kinds,
        (SELECT classes FROM __rf_classlist)               AS classes,
@@ -935,21 +1069,22 @@ CREATE OR REPLACE MACRO rf_class_fit(tbl, outcome, n_trees := 100, mtry := NULL,
                                      min_impurity_decrease := 0.0, sample_frac := 1.0,
                                      replace_sample := true, criterion := 'gini', seed := 42,
                                      weights_col := NULL, class_weight := NULL,
-                                     tree_from := NULL, tree_to := NULL) AS TABLE
+                                     tree_from := NULL, tree_to := NULL, splitter := 'best') AS TABLE
 SELECT * FROM __rf_fit(tbl, outcome, 'classification', 'rf_class_fit', n_trees, mtry, max_depth,
                        min_samples_split, min_samples_leaf, min_impurity_decrease,
                        sample_frac, replace_sample, criterion, seed, weights_col, class_weight,
-                       tree_from, tree_to);
+                       tree_from, tree_to, splitter);
 
 CREATE OR REPLACE MACRO rf_reg_fit(tbl, outcome, n_trees := 100, mtry := NULL, max_depth := 20,
                                    min_samples_split := 2, min_samples_leaf := 1,
                                    min_impurity_decrease := 0.0, sample_frac := 1.0,
                                    replace_sample := true, criterion := 'mse', seed := 42,
-                                   weights_col := NULL, tree_from := NULL, tree_to := NULL) AS TABLE
+                                   weights_col := NULL, tree_from := NULL, tree_to := NULL,
+                                   splitter := 'best') AS TABLE
 SELECT * FROM __rf_fit(tbl, outcome, 'regression', 'rf_reg_fit', n_trees, mtry, max_depth,
                        min_samples_split, min_samples_leaf, min_impurity_decrease,
                        sample_frac, replace_sample, criterion, seed, weights_col, NULL,
-                       tree_from, tree_to);
+                       tree_from, tree_to, splitter);
 
 
 -- ---------------------------------------------------------------------------
@@ -1000,7 +1135,7 @@ CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100,
                                            min_samples_leaf := 1, min_impurity_decrease := 0.0,
                                            sample_frac := 1.0, replace_sample := true,
                                            criterion := NULL, seed := 42, weights_col := NULL,
-                                           class_weight := NULL) AS (
+                                           class_weight := NULL, splitter := 'best') AS (
   WITH __rf_bcfg AS (
     SELECT CASE WHEN family = 'classification' THEN 'rf_class_fit' ELSE 'rf_reg_fit' END AS fitmacro,
            coalesce(criterion, CASE WHEN family = 'classification' THEN 'gini' ELSE 'mse' END) AS crit
@@ -1022,6 +1157,7 @@ CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100,
              || ', criterion := ' || __rf_quote((SELECT crit FROM __rf_bcfg))
              || ', seed := ' || seed
              || ', weights_col := ' || coalesce(__rf_quote(weights_col), 'NULL')
+             || ', splitter := ' || __rf_quote(splitter)
              || CASE WHEN family = 'classification'
                      THEN ', class_weight := ' || coalesce(__rf_quote(class_weight), 'NULL')
                      ELSE '' END
@@ -1714,6 +1850,7 @@ SELECT any_value(family)                                   AS family,
        any_value(mtry)                                     AS mtry,
        any_value(max_depth)                                AS max_depth,
        any_value(criterion)                                AS criterion,
+       any_value(splitter)                                 AS splitter,
        any_value(seed)                                     AS seed,
        any_value(n_train)                                  AS n_train,
        any_value(sample_frac)                              AS sample_frac,
@@ -1738,6 +1875,13 @@ FROM query_table(model);
 --
 -- rf_cv_depth(tbl, outcome, family, depth_grid, mtry := NULL, k := 5, ...)
 --   the same, sweeping max_depth instead of mtry; returns (max_depth, cv_error).
+--
+-- NOTE: cross-validation is BEST-SPLIT (Random Forest) ONLY. rf_cv / rf_cv_depth
+-- have no `splitter` parameter -- they always tune an RF (splitter := 'best').
+-- Extra Trees (splitter := 'random') is not cross-validated here; the CV grower
+-- below is an independent recursion that implements only the best-split search.
+-- To tune an ET forest, sweep hyper-parameters by fitting rf_class_fit /
+-- rf_reg_fit with splitter := 'random' directly.
 --
 -- Because a table macro cannot be re-invoked per (grid value, fold), the whole
 -- sweep is ONE recursive forest over the (grid value x fold x tree) space: group

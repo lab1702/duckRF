@@ -5,7 +5,10 @@ grows a random forest — **classification or regression** — entirely inside
 DuckDB, and gives you **fit**, **predict**, **evaluate**, **out-of-bag**
 scoring, **feature importance**, per-tree predictions and **cross-validation**
 for tuning, plus **batch fitting** to grow large forests in a bounded memory
-envelope. Both families take the same arguments and handle **numeric *and*
+envelope. A `splitter := 'random'` switch turns the forest into **Extra Trees**
+(extremely randomized trees) — random per-node splits, lower variance, faster
+fits — with everything else (predict, importance, OOB, quantiles, batch)
+unchanged. Both families take the same arguments and handle **numeric *and*
 categorical features and outcomes** natively: `VARCHAR`/`ENUM` columns are true
 categoricals (subset splits, not one-hot), and the classification outcome can be
 a boolean, an integer, or a string label.

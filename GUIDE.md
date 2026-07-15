@@ -56,6 +56,7 @@ Both families take the identical argument list:
 | `seed` | `42` | all randomness is `md5_number(seed || …)`; must not be `NULL` |
 | `weights_col` | `NULL` | column of non-negative per-row sample weights (multiplies the bootstrap count — sklearn's `sample_weight`) |
 | `class_weight` | `NULL` | classification only; `'balanced'` multiplies each row's weight by `n / (K · n_k)` |
+| `splitter` | `'best'` | `'best'` = Random Forest (search for the best split); `'random'` = **Extra Trees** (one random split per candidate feature). See [below](#extra-trees) |
 
 **The bootstrap (bagging).** Each tree trains on a resample of the training
 rows. With `replace_sample := true` (the default) a tree draws
@@ -89,6 +90,55 @@ problem. Combine it with `weights_col` and the two multiply.
 ```sql
 CREATE TABLE m AS SELECT * FROM rf_class_fit('transactions', 'is_fraud', class_weight := 'balanced');
 ```
+
+### <a id="extra-trees"></a>Extra Trees (extremely randomized trees)
+
+`splitter := 'random'` grows an **Extra-Trees** forest instead of a Random
+Forest. Everything about the forest is the same — the same bootstrap, the same
+`mtry` feature lottery per node, the same impurity/gain algebra, the same
+pruning — *except how each node's split is chosen*:
+
+- **Random Forest** (`splitter := 'best'`, the default) searches every candidate
+  feature for the single **best** split (the exact CART optimum).
+- **Extra Trees** (`splitter := 'random'`) draws **one random split per
+  candidate feature** and keeps the feature whose random split has the best gain.
+  For a numeric feature it draws a single threshold uniformly in the feature's
+  in-node range `[min, max)` (`thr = min + u·(max − min)`, `u ∈ [0,1)` from the
+  same `md5_number(seed || …)` stream — no `random()`, so it is fully
+  deterministic in `seed`). For a categorical feature it flips an independent
+  coin per level to build a random left/right subset. A draw that leaves a child
+  empty (or below `min_samples_leaf`) is rejected, and a node with no admissible
+  random split becomes a leaf, exactly as on the best path.
+
+Randomizing the split trades a little more bias for **lower variance** and
+**faster fits** (no split search), and often helps on **noisy** data. Because
+only the split *selection* changes, the model table is byte-for-byte the same
+shape and **`rf_*_predict`, `rf_*_evaluate`, `rf_importance` (MDI), `rf_*_oob`,
+`rf_reg_quantile` and batch fitting all work on an Extra-Trees model with no
+changes.** `rf_summary` reports the `splitter`. (The one exception is
+[`rf_cv`](#tuning-hyperparameters) / `rf_cv_depth`, which are **best-split
+(Random Forest) only** — they have no `splitter` parameter. To tune an
+Extra-Trees forest, sweep hyper-parameters by fitting with `splitter := 'random'`
+directly.)
+
+`splitter` is **orthogonal to bootstrapping**. sklearn's `ExtraTrees*` default to
+`bootstrap=False`; in duckRF that is the separate `replace_sample`/`sample_frac`
+knob. **Textbook Extra Trees** is therefore:
+
+```sql
+CREATE TABLE m AS SELECT * FROM rf_reg_fit('housing', 'price',
+    splitter := 'random', replace_sample := false, sample_frac := 1.0);
+```
+
+which matches `ExtraTreesRegressor(bootstrap=False, max_features=1.0)`
+(regression) or `ExtraTreesClassifier(bootstrap=False, max_features='sqrt')`
+(classification) — duckRF's `mtry` defaults already match those `max_features`.
+Keeping bootstrap **on** (the default) gives a bagged Extra-Trees hybrid and, as
+a bonus, leaves out-of-bag rows for [`rf_*_oob`](#out-of-bag) to score.
+
+> The categorical random-split rule (a per-level coin flip into a subset) is
+> duckRF's own definition — there is no sklearn reference for categorical Extra
+> Trees, just as there is none for RF categorical subset splits.
 
 **What the model table looks like.** One row per node; the root of each tree is
 `node = 1`, children are `2·node` (left) and `2·node + 1` (right). Internal nodes

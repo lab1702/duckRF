@@ -34,9 +34,10 @@ rf_class_fit(tbl, outcome
              , seed := 42
              , weights_col := NULL       -- per-row sample weights
              , class_weight := NULL       -- NULL | 'balanced'
-             , tree_from := NULL, tree_to := NULL)  -- batch fitting (see below)
+             , tree_from := NULL, tree_to := NULL   -- batch fitting (see below)
+             , splitter := 'best')        -- 'best' = RF | 'random' = Extra Trees
 rf_reg_fit(tbl, outcome, ... , criterion := 'mse', weights_col := NULL,
-           tree_from := NULL, tree_to := NULL)
+           tree_from := NULL, tree_to := NULL, splitter := 'best')
    -> the model table (one row per tree node; see schema below)
 ```
 
@@ -44,6 +45,13 @@ rf_reg_fit(tbl, outcome, ... , criterion := 'mse', weights_col := NULL,
 (sklearn's `sqrt` / `1.0`). `max_depth := NULL` grows to purity (hard cap 60);
 the default `20` **does** bind above a few thousand rows — `rf_summary` reports
 `depth_cap_hit`. `VARCHAR`/`ENUM` features are true categoricals (subset splits).
+
+**Extra Trees.** `splitter := 'random'` draws ONE random split per candidate
+feature (uniform numeric threshold in the node's range; categorical coin-flip
+subset) instead of searching for the best — lower variance, faster fits, same
+model shape (predict/importance/oob/quantile/batch all still work). Textbook ET:
+`splitter := 'random', replace_sample := false, sample_frac := 1.0` ≈ sklearn
+`ExtraTrees*(bootstrap=False)`. Default `'best'` is the unchanged Random Forest.
 
 ## Batch fitting  (bounded memory; UNION reproduces a one-shot fit)
 
@@ -68,7 +76,8 @@ rf_batched_fit_sql(tbl, outcome, family        -- 'classification' | 'regression
                    , n_trees := 100, batch_size := 10, mtry := NULL, max_depth := 20
                    , min_samples_split := 2, min_samples_leaf := 1, min_impurity_decrease := 0.0
                    , sample_frac := 1.0, replace_sample := true, criterion := NULL
-                   , seed := 42, weights_col := NULL, class_weight := NULL)  -> VARCHAR
+                   , seed := 42, weights_col := NULL, class_weight := NULL
+                   , splitter := 'best')  -> VARCHAR
 ```
 
 ```python
@@ -146,7 +155,7 @@ rf_permutation_importance(model, tbl, outcome, n_repeats := 5, seed := 42)
                          cardinality-UNBIASED; ordered importance DESC, feature; can be negative)
 rf_summary(model)    -> family, n_trees, n_nodes, n_leaves, max_depth_reached,
                         mean_leaf_depth, depth_cap_hit, n_features, mtry, max_depth,
-                        criterion, seed, n_train, sample_frac, replace_sample
+                        criterion, splitter, seed, n_train, sample_frac, replace_sample
 ```
 
 MDI is biased toward high-cardinality features — prefer `rf_permutation_importance`
@@ -163,7 +172,9 @@ rf_cv_depth(tbl, outcome, family, depth_grid, mtry := NULL, k := 5, n_trees := 1
 ```
 
 `family` ∈ `'classification'` | `'regression'`; grids are `INTEGER[]`. `cv_error`
-= misclassification rate (classification) or MSE (regression).
+= misclassification rate (classification) or MSE (regression). CV is
+**best-split (RF) only** — no `splitter` param; tune Extra Trees by fitting
+`splitter := 'random'` directly.
 
 ## Model table  (one row per tree node; every `*_fit` returns this shape)
 
@@ -177,8 +188,8 @@ imp_decrease DOUBLE (÷ w_root for sklearn's "improvement"),
 prediction DOUBLE (regression leaf), class_counts MAP(VARCHAR,DOUBLE) (dense class leaf),
 + constant forest metadata on every row: family, n_trees, seed, sample_frac,
 replace_sample, n_train, mtry, max_depth, min_samples_split, min_samples_leaf,
-min_impurity_decrease, criterion, features VARCHAR[], feature_kinds VARCHAR[],
-classes VARCHAR[] (NULL for regression), train_hash HUGEINT.
+min_impurity_decrease, criterion, splitter ('best'|'random'), features VARCHAR[],
+feature_kinds VARCHAR[], classes VARCHAR[] (NULL for regression), train_hash HUGEINT.
 ```
 
 ## Reproducibility

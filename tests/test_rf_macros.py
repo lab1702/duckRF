@@ -36,7 +36,12 @@ import duckdb
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.metrics import (
     accuracy_score,
     brier_score_loss,
@@ -1730,3 +1735,314 @@ class TestBatchFitting:
             df_run(con, "SELECT rf_batched_fit_sql('breg','y','regression', n_trees:=10, batch_size:=0)")
         with pytest.raises(DuckDBError, match="n_trees must be >= 1"):
             df_run(con, "SELECT rf_batched_fit_sql('breg','y','regression', n_trees:=0)")
+
+
+# ===========================================================================
+# 15. Extra Trees (extremely randomized trees): splitter := 'best' | 'random'
+#
+# 'best' is the RF best-split search (default, unchanged); 'random' draws ONE
+# random split per candidate feature (uniform numeric threshold, categorical
+# coin-flip subset) and keeps the feature whose random split has the best gain.
+# The strong anchor is _grow_et: an independent numpy re-grow that replays the
+# EXACT md5 mtry/threshold/coin formulas and must match duckRF bit-for-bit
+# (structure) / ~1e-9 (the DOUBLE columns).
+# ===========================================================================
+_POW53 = 9007199254740992  # 2**53
+
+
+def _et_wt(vec, crit):
+    return vec[0] if crit == "mse" else sum(vec)
+
+
+def _et_Q(vec, crit):
+    if crit == "gini":
+        W = sum(vec); return sum(x * x for x in vec) / W
+    if crit == "entropy":
+        W = sum(vec); return sum((x * math.log2(x / W) if x > 0 else 0.0) for x in vec)
+    return vec[1] * vec[1] / vec[0]
+
+
+def _et_imp(vec, crit):
+    if crit == "gini":
+        W = sum(vec); return 1.0 - sum((x / W) ** 2 for x in vec)
+    if crit == "entropy":
+        W = sum(vec); return -sum(((x / W) * math.log2(x / W)) if x > 0 else 0.0 for x in vec)
+    return max(vec[2] / vec[0] - (vec[1] / vec[0]) ** 2, 0.0)
+
+
+def _grow_et(df, feats, kinds, family, crit, seed, max_depth, mss=2, msl=1, mtry=None):
+    """Replay a single ET tree (splitter='random', replace_sample=false,
+    sample_frac=1.0 => bag is every row once) with the EXACT duckRF formulas."""
+    EPS_ = 2.220446049250313e-16
+    n = len(df); tree = 1
+    mtry = mtry if mtry is not None else len(feats)
+    depth_eff = max_depth if max_depth is not None else 60
+    kind = dict(zip(feats, kinds))
+    colvals = {f: df[f].to_numpy() for f in feats}
+    if family == "classification":
+        yv = df["y"].astype(str).to_numpy(); classes = sorted(set(yv))
+    else:
+        yraw = df["y"].to_numpy(dtype=float); ybar = float(yraw.mean()); yc = yraw - ybar
+    w_root = float(n)
+
+    def slots(idx):
+        if family == "classification":
+            return [float((yv[idx] == c).sum()) for c in classes]
+        ys = yc[idx]; return [float(len(idx)), float(ys.sum()), float((ys * ys).sum())]
+
+    out, stack = {}, [(1, 0, np.arange(n))]
+    while stack:
+        node, depth, idx = stack.pop()
+        pvec = slots(idx); nrows = len(idx); impurity = _et_imp(pvec, crit)
+        rec = dict(is_leaf=True, split_feature=None, split_kind=None, threshold=None,
+                   cats_left=None, cats_right=None, impurity=impurity, n_rows=nrows,
+                   prediction=(None if family == "classification" else pvec[1] / pvec[0] + ybar),
+                   class_counts=({c: pvec[i] for i, c in enumerate(classes)}
+                                 if family == "classification" else None))
+        if depth < depth_eff and nrows >= mss and impurity > EPS_:
+            qpar = _et_Q(pvec, crit)
+            nonconst = []
+            for f in feats:
+                v = colvals[f][idx]
+                if kind[f] == "num":
+                    vf = v.astype(float)
+                    if float(vf.min()) < float(vf.max()): nonconst.append(f)
+                elif len(set(v.astype(str))) >= 2:
+                    nonconst.append(f)
+            picked = sorted(nonconst, key=lambda f: _md5num(f"{seed}:{tree}:{node}:{f}"))[:mtry]
+            cands = []
+            for f in picked:
+                v = colvals[f][idx]
+                if kind[f] == "num":
+                    vf = v.astype(float); lo, hi = float(vf.min()), float(vf.max())
+                    u = (_md5num(f"{seed}:RT:{tree}:{node}:{f}") % _POW53) / float(_POW53)
+                    thr = lo + u * (hi - lo); lmask = vf <= thr
+                    payload = ("num", thr, None, None)
+                else:
+                    lv = v.astype(str); levels = sorted(set(lv))
+                    lset = {L for L in levels if _md5num(f"{seed}:RC:{tree}:{node}:{f}:{L}") % 2 == 0}
+                    lmask = np.array([x in lset for x in lv])
+                    payload = ("cat", None, sorted(lset), sorted(L for L in levels if L not in lset))
+                nl = int(lmask.sum()); nr = nrows - nl
+                if nl < msl or nr < msl: continue
+                lvec = slots(idx[lmask]); rvec = [pvec[i] - lvec[i] for i in range(len(pvec))]
+                gain = _et_Q(lvec, crit) + _et_Q(rvec, crit) - qpar
+                if not math.isfinite(gain) or gain / w_root + EPS_ < 0.0: continue
+                cands.append((gain, f, payload, lmask))
+            if cands:
+                gain, f, (sk, thr, cl, cr), lmask = min(cands, key=lambda t: (-t[0], t[1]))
+                rec.update(is_leaf=False, split_feature=f, split_kind=sk, threshold=thr,
+                           cats_left=cl, cats_right=cr, prediction=None, class_counts=None)
+                out[node] = rec
+                stack.append((2 * node, depth + 1, idx[lmask]))
+                stack.append((2 * node + 1, depth + 1, idx[~lmask]))
+                continue
+        out[node] = rec
+    return out
+
+
+def _duck_et_tree(con, model):
+    rows = con.execute(
+        f"SELECT node,is_leaf,split_feature,split_kind,threshold,cats_left,cats_right,"
+        f"prediction,class_counts,impurity,n_rows FROM {model} ORDER BY node").fetchall()
+    d = {}
+    for (nd, il, sf, sk, thr, cl, cr, pred, cc, imp, nr) in rows:
+        d[nd] = dict(is_leaf=il, split_feature=sf, split_kind=sk, threshold=thr,
+                     cats_left=(sorted(cl) if cl else None), cats_right=(sorted(cr) if cr else None),
+                     prediction=pred, class_counts=(dict(cc) if cc else None),
+                     impurity=imp, n_rows=nr)
+    return d
+
+
+def _et_maxerr(duck, ref):
+    assert set(duck) == set(ref), f"topology differs: sym diff {sorted(set(duck) ^ set(ref))[:8]}"
+    err = 0.0
+    for nd in duck:
+        a, b = duck[nd], ref[nd]
+        assert bool(a["is_leaf"]) == bool(b["is_leaf"]), f"node {nd} is_leaf"
+        assert a["split_feature"] == b["split_feature"], f"node {nd} feature {a['split_feature']}/{b['split_feature']}"
+        assert a["split_kind"] == b["split_kind"], f"node {nd} kind"
+        assert a["cats_left"] == b["cats_left"] and a["cats_right"] == b["cats_right"], f"node {nd} cats"
+        assert a["n_rows"] == b["n_rows"], f"node {nd} n_rows"
+        for k in ("threshold", "prediction", "impurity"):
+            if a[k] is not None and b[k] is not None:
+                err = max(err, abs(float(a[k]) - float(b[k])))
+        if a["class_counts"]:
+            for c in a["class_counts"]:
+                err = max(err, abs(a["class_counts"][c] - b["class_counts"][c]))
+    return err
+
+
+def _et_reg(seed, n=140):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(n, 4))
+    y = X @ [1.5, -2.0, 0.8, 0.3] + rng.normal(0, 0.5, n)
+    return frame(X, ["a", "b", "cc", "d"]).assign(y=y)
+
+
+class TestExtraTrees:
+    def test_default_is_best_and_metadata(self, con):
+        # splitter defaults to 'best' and equals an explicit splitter:='best'
+        _load(con, "t", _et_reg(1))
+        cols = "tree,node,is_leaf,split_feature,threshold,prediction,impurity"
+        a = df_run(con, f"SELECT {cols} FROM rf_reg_fit('t','y', n_trees:=6, max_depth:=6, seed:=3) ORDER BY tree,node")
+        b = df_run(con, f"SELECT {cols} FROM rf_reg_fit('t','y', n_trees:=6, max_depth:=6, seed:=3, splitter:='best') ORDER BY tree,node")
+        assert a.to_json() == b.to_json()
+        sp = df_run(con, "SELECT DISTINCT splitter FROM rf_reg_fit('t','y', n_trees:=2)")
+        assert list(sp.splitter) == ["best"]
+        spr = df_run(con, "SELECT DISTINCT splitter FROM rf_reg_fit('t','y', n_trees:=2, splitter:='random')")
+        assert list(spr.splitter) == ["random"]
+        con.execute("CREATE OR REPLACE TABLE m AS SELECT * FROM rf_reg_fit('t','y', n_trees:=2, splitter:='random')")
+        assert df_run(con, "SELECT splitter FROM rf_summary('m')").splitter[0] == "random"
+
+    # Regression carries FRACTIONAL slots (y is centered by a fractional mean),
+    # so deep in the tree two candidate random splits can be tied in gain within
+    # float noise and duckDB's hash-agg summation order (vs numpy's) resolves the
+    # tie differently -- the associativity the library documents. The replay is
+    # exact at moderate depth (bigger nodes, no sub-ULP ties); classification
+    # (integer slots) is anchored deeper below.
+    @pytest.mark.parametrize("max_depth", [4, 5])
+    def test_numpy_replay_regression(self, con, max_depth):
+        df = _et_reg(3); _load(con, "t", df)
+        con.execute(f"CREATE OR REPLACE TABLE m AS SELECT * FROM rf_reg_fit('t','y', "
+                    f"n_trees:=1, splitter:='random', replace_sample:=false, sample_frac:=1.0, "
+                    f"mtry:=4, seed:=7, max_depth:={max_depth})")
+        ref = _grow_et(df, ["a", "b", "cc", "d"], ["num"] * 4, "regression", "mse", 7, max_depth, mtry=4)
+        assert _et_maxerr(_duck_et_tree(con, "m"), ref) < 1e-9
+
+    @pytest.mark.parametrize("crit", ["gini", "entropy"])
+    def test_numpy_replay_classification(self, con, crit):
+        rng = np.random.default_rng(5)
+        X = rng.normal(size=(150, 4))
+        y = ((X[:, 0] * 1.2 - X[:, 1] + rng.normal(0, 0.5, 150)) > 0).astype(int) + (X[:, 2] > 1.0).astype(int)
+        df = frame(X, ["a", "b", "cc", "d"]).assign(y=y); _load(con, "t", df)
+        con.execute(f"CREATE OR REPLACE TABLE m AS SELECT * FROM rf_class_fit('t','y', "
+                    f"n_trees:=1, splitter:='random', replace_sample:=false, sample_frac:=1.0, "
+                    f"mtry:=4, seed:=9, criterion:='{crit}', max_depth:=7)")
+        ref = _grow_et(df, ["a", "b", "cc", "d"], ["num"] * 4, "classification", crit, 9, 7, mtry=4)
+        assert _et_maxerr(_duck_et_tree(con, "m"), ref) < 1e-9
+
+    def test_numpy_replay_categorical(self, con):
+        rng = np.random.default_rng(8); n = 220
+        x0 = rng.normal(size=n); col = np.array(["a", "b", "c", "d"])[rng.integers(0, 4, n)]
+        y = ((x0 > 0).astype(int) ^ np.isin(col, ["a", "c"]).astype(int))
+        df = pd.DataFrame({"x0": x0, "col": col, "y": y}); _load(con, "t", df)
+        con.execute("CREATE OR REPLACE TABLE m AS SELECT * FROM rf_class_fit('t','y', "
+                    "n_trees:=1, splitter:='random', replace_sample:=false, sample_frac:=1.0, "
+                    "mtry:=2, seed:=4, criterion:='gini', max_depth:=8)")
+        ref = _grow_et(df, ["col", "x0"], ["cat", "num"], "classification", "gini", 4, 8, mtry=2)
+        d = _duck_et_tree(con, "m")
+        assert any(r["split_kind"] == "cat" for r in d.values())  # a random subset split happened
+        assert _et_maxerr(d, ref) < 1e-9
+
+    def test_feature_argmax_agrees_with_replay(self, con):
+        rng = np.random.default_rng(11)
+        X = rng.normal(size=(200, 5)); y = X @ [1.0, -1.5, 0.5, 2.0, -0.3] + rng.normal(0, 0.4, 200)
+        feats = ["a", "b", "cc", "d", "e"]; df = frame(X, feats).assign(y=y); _load(con, "t", df)
+        con.execute("CREATE OR REPLACE TABLE m AS SELECT * FROM rf_reg_fit('t','y', "
+                    "n_trees:=1, splitter:='random', replace_sample:=false, sample_frac:=1.0, "
+                    "mtry:=5, seed:=2, max_depth:=6)")
+        d = _duck_et_tree(con, "m")
+        ref = _grow_et(df, feats, ["num"] * 5, "regression", "mse", 2, 6, mtry=5)
+        assert all(d[nd]["split_feature"] == ref[nd]["split_feature"]
+                   for nd in d if not d[nd]["is_leaf"])
+
+    def test_threshold_draw_uniform(self, con):
+        keys = [f"42:RT:1:{node}:{c}" for node in range(1, 800) for c in ("x0", "x1")]
+        duck = con.execute(
+            "SELECT (md5_number(s) % 9007199254740992::UHUGEINT)::DOUBLE/9007199254740992.0 u "
+            "FROM (SELECT unnest(?::VARCHAR[]) s)", [keys]).df().u.to_numpy()
+        assert np.allclose(duck, [(_md5num(s) % _POW53) / _POW53 for s in keys])
+        from scipy.stats import kstest
+        assert kstest(duck, "uniform").pvalue > 0.01
+
+    def test_sklearn_extratrees_parity_and_ne_rf(self, con):
+        rng = np.random.default_rng(21)
+        X = rng.normal(size=(600, 6)); y = X @ [2, -1, 0.5, 1.3, -0.7, 0.9] + rng.normal(0, 0.6, 600)
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0)
+        f = [f"x{i}" for i in range(6)]
+        _load(con, "tr", frame(Xtr, f).assign(y=ytr)); _load(con, "te", frame(Xte, f).assign(y=yte))
+        con.execute("CREATE OR REPLACE TABLE m AS SELECT * FROM rf_reg_fit('tr','y', "
+                    "n_trees:=120, splitter:='random', replace_sample:=false, sample_frac:=1.0, seed:=1)")
+        pr = df_run(con, "SELECT prediction FROM rf_reg_predict('m','te')").prediction.to_numpy()
+        sk = ExtraTreesRegressor(n_estimators=300, bootstrap=False, max_features=1.0,
+                                 random_state=0).fit(Xtr, ytr)
+        assert abs(r2_score(yte, pr) - r2_score(yte, sk.predict(Xte))) < 0.05
+        # ET != RF on the same data/seed
+        con.execute("CREATE OR REPLACE TABLE mrf AS SELECT * FROM rf_reg_fit('tr','y', "
+                    "n_trees:=120, replace_sample:=false, sample_frac:=1.0, seed:=1)")
+        diff = df_run(con, "SELECT count(*) c FROM (SELECT tree,node,split_feature,threshold FROM m "
+                      "EXCEPT SELECT tree,node,split_feature,threshold FROM mrf)").c[0]
+        assert diff > 0
+
+    def test_classification_extratrees_parity(self, con):
+        rng = np.random.default_rng(22)
+        X = rng.normal(size=(600, 6)); y = ((X[:, 0] + X[:, 1] - X[:, 2] + rng.normal(0, 0.5, 600)) > 0).astype(int)
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0)
+        f = [f"x{i}" for i in range(6)]
+        _load(con, "trc", frame(Xtr, f).assign(y=ytr)); _load(con, "tec", frame(Xte, f).assign(y=yte))
+        con.execute("CREATE OR REPLACE TABLE mc AS SELECT * FROM rf_class_fit('trc','y', "
+                    "n_trees:=120, splitter:='random', replace_sample:=false, sample_frac:=1.0, seed:=1)")
+        acc = df_run(con, "SELECT accuracy FROM rf_class_evaluate('mc','tec','y')").accuracy[0]
+        sk = ExtraTreesClassifier(n_estimators=300, bootstrap=False, max_features="sqrt",
+                                  random_state=0).fit(Xtr, ytr)
+        assert abs(acc - accuracy_score(yte, sk.predict(Xte))) < 0.05
+
+    def test_batch_union_bit_identical(self, con):
+        con.execute("""CREATE OR REPLACE TABLE bclf AS
+            SELECT i AS x1, (i*13)%20 AS x2, ['a','b','c'][(i%3)+1] AS colour,
+                   CASE WHEN (i%10)<6 THEN 'yes' ELSE 'no' END AS y FROM range(240) t(i)""")
+        con.execute("CREATE OR REPLACE TABLE one AS SELECT * FROM rf_class_fit('bclf','y', "
+                    "n_trees:=30, max_depth:=6, splitter:='random', seed:=5)")
+        sql = df_run(con, "SELECT rf_batched_fit_sql('bclf','y','classification', n_trees:=30, "
+                     "batch_size:=10, max_depth:=6, splitter:='random', seed:=5) s").s[0]
+        assert "splitter := 'random'" in sql
+        con.execute(f"CREATE OR REPLACE TABLE bat AS {sql}")
+        assert _col_diff(con, "one", "bat", _FULL + ",splitter") == 0
+
+    def test_composition_importance_oob_quantile(self, con):
+        df = _et_reg(31, n=300); _load(con, "tr", df)
+        con.execute("CREATE OR REPLACE TABLE m AS SELECT * FROM rf_reg_fit('tr','y', "
+                    "n_trees:=60, splitter:='random', seed:=3)")  # bootstrap on -> OOB has rows
+        imp = df_run(con, "SELECT feature, importance FROM rf_importance('m')")
+        assert len(imp) == 4 and imp.importance.notna().all() and (imp.importance >= 0).all()
+        oob = df_run(con, "SELECT r2 FROM rf_reg_oob('m','tr','y')").r2[0]
+        assert oob > 0.5
+        q = df_run(con, "SELECT quantile_pred[0.1] AS lo, quantile_pred[0.9] AS hi "
+                   "FROM rf_reg_quantile('m','tr','y',[0.1,0.9])")
+        assert len(q) == 300 and bool(np.all(q["lo"].to_numpy() <= q["hi"].to_numpy()))
+
+    def test_determinism(self, con):
+        df = _et_reg(41); _load(con, "t", df)
+        q = ("SELECT tree,node,is_leaf,split_feature,threshold,prediction FROM "
+             "rf_reg_fit('t','y', n_trees:=12, splitter:='random', seed:={}, max_depth:=6) ORDER BY tree,node")
+        assert df_run(con, q.format(7)).to_json() == df_run(con, q.format(7)).to_json()
+        assert df_run(con, q.format(7)).to_json() != df_run(con, q.format(8)).to_json()
+
+    def test_bad_splitter_errors(self, con):
+        _load(con, "t", _et_reg(1))
+        with pytest.raises(DuckDBError, match="splitter must be"):
+            df_run(con, "SELECT * FROM rf_reg_fit('t','y', splitter:='xx')")
+        with pytest.raises(DuckDBError, match="splitter must be"):
+            df_run(con, "SELECT * FROM rf_class_fit('t','y', splitter:='greedy')")
+        # empty string is not a valid splitter either
+        with pytest.raises(DuckDBError, match="splitter must be"):
+            df_run(con, "SELECT * FROM rf_reg_fit('t','y', splitter:='')")
+        # splitter := NULL must raise, not silently produce a degenerate all-leaf
+        # forest (SQL three-valued logic: NULL NOT IN (...) is NULL, so the guard
+        # has to catch NULL explicitly). Both wrappers share the __rf_fit guard.
+        with pytest.raises(DuckDBError, match="splitter must be"):
+            df_run(con, "SELECT * FROM rf_reg_fit('t','y', n_trees:=3, splitter:=NULL, seed:=1)")
+        with pytest.raises(DuckDBError, match="splitter must be"):
+            df_run(con, "SELECT * FROM rf_class_fit('t','y', n_trees:=3, splitter:=NULL, seed:=1)")
+
+    def test_constant_feature_never_split_and_msl_leaf(self, con):
+        df = _et_reg(1).assign(konst=3.0); _load(con, "tc", df)
+        con.execute("CREATE OR REPLACE TABLE mc AS SELECT * FROM rf_reg_fit('tc','y', "
+                    "n_trees:=20, splitter:='random', seed:=1, max_depth:=8)")
+        assert df_run(con, "SELECT count(*) c FROM mc WHERE split_feature='konst'").c[0] == 0
+        # every random split violates min_samples_leaf => the root is a leaf
+        con.execute("CREATE OR REPLACE TABLE ml AS SELECT * FROM rf_reg_fit('tc','y', "
+                    "n_trees:=1, splitter:='random', replace_sample:=false, sample_frac:=1.0, "
+                    "min_samples_leaf:=120, seed:=1, max_depth:=8)")
+        assert bool(df_run(con, "SELECT is_leaf FROM ml WHERE node=1").is_leaf[0])

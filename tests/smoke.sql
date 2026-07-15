@@ -199,4 +199,24 @@ SELECT CASE
     ELSE error('SMOKE FAIL: determinism check failed under threads=1')
   END;
 
+-- ------------------------------------------------- Extra Trees (splitter:='random')
+-- An extremely-randomized forest fits, predicts in range, records splitter='random'
+-- in its metadata, and differs from the RF ('best') forest on the same data/seed.
+CREATE TABLE et_m AS SELECT * FROM rf_reg_fit('reg', 'y', n_trees := 20, seed := 5, max_depth := 6,
+                                              splitter := 'random');
+CREATE TABLE rf_m AS SELECT * FROM rf_reg_fit('reg', 'y', n_trees := 20, seed := 5, max_depth := 6);
+SELECT CASE
+    WHEN (SELECT DISTINCT splitter FROM et_m) = 'random'
+     AND (SELECT splitter FROM rf_summary('et_m')) = 'random'
+     AND (SELECT count(*) FROM rf_reg_predict('et_m', 'reg')) = 200
+     AND (SELECT min(prediction) FROM rf_reg_predict('et_m', 'reg')) >= (SELECT min(y) FROM reg)
+     AND (SELECT max(prediction) FROM rf_reg_predict('et_m', 'reg')) <= (SELECT max(y) FROM reg)
+     -- the random splitter really changed the trees vs the best splitter
+     AND (SELECT count(*) FROM (SELECT tree, node, split_feature, threshold FROM et_m
+                                EXCEPT
+                                SELECT tree, node, split_feature, threshold FROM rf_m)) > 0
+    THEN 'PASS  Extra Trees (splitter:=''random'') fits, predicts in range, differs from RF'
+    ELSE error('SMOKE FAIL: Extra Trees random splitter check failed')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

@@ -55,7 +55,21 @@ rf_reg_predict_trees(model, tbl, ...)    -> __rf_rid__, tree, prediction
 ```
 
 `pred` is the argmax of the soft vote (ties → smallest label). `*_predict_trees`
-gives one row per (row, tree) — the ensemble spread, for prediction intervals.
+gives one row per (row, tree) — the ensemble spread of the *mean* estimate.
+
+## Prediction intervals  (Quantile Regression Forest — honest intervals for a new obs)
+
+```
+rf_reg_quantile(model, tbl, outcome, quantiles,
+                newdata := NULL, na_action := 'null', n_trees := NULL)
+   -> newdata cols + quantile_pred MAP(DOUBLE, DOUBLE)   -- {level -> value}
+```
+
+`tbl` = reference sample (the training table); its `outcome` responses, weighted by
+shared-leaf membership, form the conditional distribution of Y|x. `quantiles` is a
+`DOUBLE[]` of levels in (0,1). `newdata := NULL` scores `tbl`. Pull a level with
+`quantile_pred[0.05]`. Unlike `*_predict_trees` (spread of the ensemble *mean*,
+under-covers), the `[0.05,0.95]` band covers ≈90% of real observations.
 
 ## Evaluate  (returns one row; drops rows with NULL outcome or no prediction)
 

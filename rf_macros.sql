@@ -19,9 +19,9 @@
 --   would turn a typo into a silently wrong MODEL FAMILY rather than an error.
 --   The family tokens differ by three characters on purpose.
 --
--- Scoring / diagnostics (rf_class_predict, rf_reg_predict, *_evaluate,
--- *_oob*, rf_importance, rf_permutation_importance, rf_summary, rf_cv) live
--- further down this file.
+-- Scoring / diagnostics (rf_class_predict, rf_reg_predict, rf_reg_quantile,
+-- *_evaluate, *_oob*, rf_importance, rf_permutation_importance, rf_summary,
+-- rf_cv) live further down this file.
 --
 -- Internal helper (do not call directly, subject to change):
 --   __rf_fit(tbl, outcome, family, caller, n_trees, mtry, max_depth,
@@ -895,6 +895,8 @@ SELECT * FROM __rf_fit(tbl, outcome, 'regression', 'rf_reg_fit', n_trees, mtry, 
 --   rf_reg_predict(model, tbl, na_action := 'null', n_trees := NULL)
 --   rf_class_predict_trees(model, tbl, na_action := 'null', n_trees := NULL)
 --   rf_reg_predict_trees(model, tbl, na_action := 'null', n_trees := NULL)
+--   rf_reg_quantile(model, tbl, outcome, quantiles, newdata := NULL,
+--                   na_action := 'null', n_trees := NULL)   -- QRF intervals
 --   rf_class_evaluate(model, tbl, outcome, na_action := 'null', n_trees := NULL)
 --   rf_reg_evaluate(model, tbl, outcome, na_action := 'null', n_trees := NULL)
 --   rf_class_oob_predict(model, tbl) / rf_reg_oob_predict(model, tbl)
@@ -2192,3 +2194,158 @@ SELECT o.feature, o.importance, o.importance_std
 FROM __rf_chk ck LEFT JOIN __rf_out o ON true
 WHERE ck.ok AND o.feature IS NOT NULL
 ORDER BY o.importance DESC, o.feature;
+
+
+-- ---------------------------------------------------------------------------
+-- rf_reg_quantile -- Meinshausen (2006) Quantile Regression Forest intervals.
+--
+--   rf_reg_quantile(model, tbl, outcome, quantiles,
+--                   newdata := NULL, na_action := 'null', n_trees := NULL)
+--      -> newdata columns + quantile_pred MAP(DOUBLE, DOUBLE)   {level -> value}
+--
+-- The HONEST prediction interval, the analogue of duckLM's *_predict_ci: the
+-- conditional distribution of Y | X=x is the WEIGHTED EMPIRICAL distribution of
+-- the TRAINING responses that fall in x's leaves across the forest, and its
+-- quantiles are genuine predictive intervals for a NEW observation. `tbl` is the
+-- reference sample (normally the training table) whose `outcome` responses form
+-- that pool; `newdata` are the rows to score (NULL scores `tbl` itself).
+--
+-- This is NOT quantiles of the per-tree MEAN predictions (rf_reg_predict_trees):
+-- that is the far narrower spread of the ensemble's estimate of E[Y|x] and it
+-- badly UNDER-covers real observations. This macro implements the correct thing.
+--
+-- Method. Let T_x = the trees that scored x. Drop every reference row down every
+-- tree; n_t(L) = reference rows in leaf L of tree t. For a query row x with leaf
+-- L_t(x), reference row i has QRF weight
+--     w_i(x) = (1/T_x) * sum_t  1[ leaf_t(x_i) = L_t(x) ] / n_t(L_t(x)) ,
+-- the weights sum to 1 over i. The conditional CDF is F(y|x) = sum_i w_i 1[y_i<=y]
+-- and Q_alpha(x) is the type-1 inverse CDF: the smallest reference response whose
+-- cumulative weight (responses sorted ascending) first reaches alpha. Reference
+-- rows are pooled by equal y (their weights add), which leaves the type-1 step
+-- CDF -- hence every quantile -- unchanged, so the result is deterministic.
+--
+-- Reuse: __rf_walk gives (rid, tree, node=leaf) for both walks; the outcome is
+-- read via the same tolerant VARCHAR long-form as __rf_reg_eval so a missing
+-- outcome column hits the clean guard, not a binder error. Both walks use the
+-- SAME na_action / n_trees, so n_t and the leaf lookups are consistent.
+--
+-- A query row no tree scored (all-NULL features under 'null', every tree
+-- abstaining under 'skip_tree') has no walk rows and gets a NULL map, exactly
+-- like rf_reg_predict's NULL contract. Reference rows with a NULL outcome are
+-- dropped from the pool BEFORE n_t is counted, so the weights still normalise.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO rf_reg_quantile(model, tbl, outcome, quantiles,
+                                        newdata := NULL, na_action := 'null', n_trees := NULL) AS TABLE
+WITH
+-- Column types of the reference and query tables (same DESCRIBE-free discovery
+-- trick as __rf_walk), used only by the guards below.
+__rf_reftypes AS MATERIALIZED (
+    SELECT colname, typename
+    FROM (SELECT *
+          FROM (SELECT 1 AS __rf_one)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+         UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
+),
+__rf_qrytypes AS MATERIALIZED (
+    SELECT colname, typename
+    FROM (SELECT *
+          FROM (SELECT 1 AS __rf_one)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(coalesce(newdata, tbl)) LIMIT 1) ON true)
+         UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
+),
+-- Guards, house style: a CASE that error()s, referenced (WHERE ck.ok) by the
+-- pipeline so it always fires. __rf_famchk repeats the family/empty check so it
+-- fires with a clean message even if the walk were optimised away. Outcome and
+-- collision come from the tolerant type long-form, never COLUMNS(lambda), so a
+-- missing/duplicate column is a clean guard, not a binder error.
+__rf_qchk AS (
+    SELECT CASE
+             WHEN starts_with(lower(tbl), '__rf_') OR starts_with(lower(model), '__rf_')
+                  OR starts_with(lower(coalesce(newdata, '')), '__rf_')
+               THEN error('rf_reg_quantile: table names beginning with "__rf_" are reserved for internal use; please rename')
+             WHEN (SELECT count(*) FROM __rf_qrytypes WHERE starts_with(lower(colname), '__rf_')) > 0
+                  OR (SELECT count(*) FROM __rf_reftypes WHERE starts_with(lower(colname), '__rf_')) > 0
+               THEN error('rf_reg_quantile: column names beginning with "__rf_" are reserved for internal use; please rename')
+             WHEN (SELECT __rf_famchk(model, 'rf_reg_quantile', 'regression')) IS NULL THEN false
+             WHEN quantiles IS NULL OR len(quantiles) = 0
+               THEN error('rf_reg_quantile: quantiles must be a non-empty DOUBLE[] of levels in (0, 1)')
+             WHEN len(list_filter(quantiles, lambda x: x IS NULL OR x <= 0.0 OR x >= 1.0)) > 0
+               THEN error('rf_reg_quantile: every requested quantile level must be strictly in (0, 1)')
+             WHEN (SELECT count(*) FROM __rf_reftypes WHERE colname = outcome) = 0
+               THEN error('rf_reg_quantile: outcome column "' || outcome || '" not found in "' || tbl || '"')
+             WHEN (SELECT count(*) FROM __rf_qrytypes WHERE lower(colname) = 'quantile_pred') > 0
+               THEN error('rf_reg_quantile: the input table already has a "quantile_pred" column, which collides with the output column; rename or drop it first (e.g. SELECT * EXCLUDE (quantile_pred))')
+             ELSE true
+           END AS ok
+),
+-- Reference leaf membership, then its outcome via the tolerant long-form.
+__rf_refwalk AS MATERIALIZED (
+    SELECT w.rid, w.tree, w.node
+    FROM __rf_walk(model, tbl, 'rf_reg_quantile', 'regression', na_action, n_trees, false) w
+    CROSS JOIN __rf_qchk ck WHERE ck.ok
+),
+__rf_refy AS MATERIALIZED (
+    SELECT rid, TRY_CAST(sval AS DOUBLE) AS y
+    FROM (SELECT __rf_rid__ AS rid, name AS col, value AS sval
+          FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
+                         FROM query_table(tbl))
+                ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value))
+    WHERE col = outcome
+),
+-- The QRF pool: reference rows with a non-NULL response, tagged with their leaf.
+-- Dropping NULL responses BEFORE the leaf count keeps sum_i w_i = 1 exact.
+__rf_ref AS MATERIALIZED (
+    SELECT w.tree, w.node, y.y
+    FROM __rf_refwalk w JOIN __rf_refy y ON y.rid = w.rid
+    WHERE y.y IS NOT NULL
+),
+-- n_t(leaf): reference rows in each (tree, leaf).
+__rf_leafn AS MATERIALIZED (
+    SELECT tree, node, count(*) AS n_t FROM __rf_ref GROUP BY tree, node
+),
+-- Query leaf membership, and how many trees scored each query row (T_x).
+__rf_qwalk AS MATERIALIZED (
+    SELECT w.rid, w.tree, w.node
+    FROM __rf_walk(model, coalesce(newdata, tbl), 'rf_reg_quantile', 'regression', na_action, n_trees, false) w
+    CROSS JOIN __rf_qchk ck WHERE ck.ok
+),
+__rf_qtrees AS (SELECT rid, count(*) AS ntree FROM __rf_qwalk GROUP BY rid),
+-- Per (query row, reference response value): total weight before the 1/T_x scale
+-- is sum over trees & pooled rows of 1/n_t(leaf). Divide by T_x -> weights sum 1.
+__rf_dist AS (
+    SELECT c.qrid, c.y, c.wsum / qt.ntree AS w
+    FROM (
+        SELECT q.rid AS qrid, r.y AS y, sum(1.0 / ln.n_t) AS wsum
+        FROM __rf_qwalk q
+        JOIN __rf_leafn ln ON ln.tree = q.tree AND ln.node = q.node
+        JOIN __rf_ref    r ON r.tree = q.tree AND r.node = q.node
+        GROUP BY q.rid, r.y
+    ) c
+    JOIN __rf_qtrees qt ON qt.rid = c.qrid
+),
+-- Cumulative weight over the pooled responses sorted ascending (deterministic:
+-- the pooled y are distinct within a query row).
+__rf_cum AS (
+    SELECT qrid, y,
+           sum(w) OVER (PARTITION BY qrid ORDER BY y ROWS UNBOUNDED PRECEDING) AS cw
+    FROM __rf_dist
+),
+-- Type-1 inverse CDF: smallest response whose cumulative weight first reaches the
+-- level. One row per (query row, requested level).
+__rf_q AS (
+    SELECT c.qrid, lv.q AS level, min(c.y) FILTER (c.cw >= lv.q) AS qval
+    FROM __rf_cum c CROSS JOIN (SELECT unnest(quantiles)::DOUBLE AS q) lv
+    GROUP BY c.qrid, lv.q
+),
+__rf_map AS (
+    SELECT qrid,
+           map_from_entries(list(struct_pack(key := level, value := qval) ORDER BY level)) AS quantile_pred
+    FROM __rf_q
+    GROUP BY qrid
+)
+SELECT n.* EXCLUDE (__rf_rid__), m.quantile_pred
+FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(coalesce(newdata, tbl))) n
+CROSS JOIN __rf_qchk g
+LEFT JOIN __rf_map m ON m.qrid = n.__rf_rid__
+WHERE g.ok
+ORDER BY n.__rf_rid__;

@@ -1363,3 +1363,188 @@ class TestPermutationImportance:
         con.execute("CREATE OR REPLACE TABLE mempty AS SELECT * FROM m WHERE false")
         with pytest.raises(DuckDBError, match="empty"):
             df_run(con, "SELECT * FROM rf_permutation_importance('mempty','tr','y')")
+
+
+# --------------------------------------------------------------------------- #
+# rf_reg_quantile -- Meinshausen Quantile Regression Forest prediction intervals
+# --------------------------------------------------------------------------- #
+# beta is FIXED so a train/test pair share one data-generating process (a fresh
+# beta per split would leave the forest un/anti-correlated with test y and make
+# coverage meaningless). Features and y are jittered to be distinct, so the
+# single-tree partition has no tied splits -- the exact 1e-9 anchor.
+_QBETA = np.random.default_rng(20240714).normal(size=6)
+
+
+def _qdata(n, d, seed):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(n, d)) + rng.normal(scale=1e-6, size=(n, d))
+    y = X @ _QBETA[:d] + rng.normal(size=n) + rng.normal(scale=1e-9, size=n)
+    return frame(X), y
+
+
+def _wquantile_type1(ys, ws, alphas):
+    """Type-1 inverse-CDF weighted quantile: smallest response whose cumulative
+    weight (responses sorted ascending, weights normalised) first reaches alpha.
+    The exact definition rf_reg_quantile implements."""
+    order = np.argsort(ys, kind="mergesort")  # stable, ties by original order
+    ys_s = np.asarray(ys, float)[order]
+    ws_s = np.asarray(ws, float)[order]
+    ws_s = ws_s / ws_s.sum()
+    cw = np.cumsum(ws_s)
+    return {a: ys_s[int(np.argmax(cw >= a))] for a in alphas}
+
+
+def _lv(levels):
+    return "[" + ", ".join(str(q) for q in levels) + "]::DOUBLE[]"
+
+
+def _maps_ordered(con, sql):
+    """quantile_pred maps in a stable, output-preserving order."""
+    return [r[0] for r in con.execute(
+        f"SELECT quantile_pred FROM (SELECT row_number() OVER () __r, quantile_pred "
+        f"FROM ({sql})) ORDER BY __r").fetchall()]
+
+
+class TestQuantile:
+    def test_single_tree_exact_vs_sklearn(self, con):
+        # One CART (n_trees=1, sample_frac=1, replace=false, mtry=d) == sklearn's
+        # tree partition. Get each row's leaf from an INDEPENDENT sklearn
+        # DecisionTreeRegressor.apply(), compute the type-1 weighted quantile in
+        # numpy, and assert rf_reg_quantile matches to 1e-9 -- in-sample (partition
+        # identical) and on a holdout (only for rows the two trees route alike,
+        # gated on duckRF's single-tree mean == sklearn's; a differently-placed
+        # split threshold is a tree-induction difference, not a quantile one).
+        d = 4
+        Xtr, ytr = _qdata(400, d, 1)
+        Xte, _ = _qdata(120, d, 2)
+        _load(con, "qtr", Xtr.assign(y=ytr))
+        _load(con, "qte", Xte.assign(y=_qdata(120, d, 2)[1]))
+        fit_tbl(con, "rf_reg_fit", "qtr", "qm", mtry=d, min_samples_leaf=10,
+                max_depth="NULL", **SINGLE)
+        skt = DecisionTreeRegressor(random_state=0, min_samples_leaf=10).fit(Xtr.values, ytr)
+        ref_leaf = skt.apply(Xtr.values)
+        levels = [0.1, 0.25, 0.5, 0.75, 0.9]
+        lv = _lv(levels)
+        max_err = 0.0
+        for scoretbl, Xq, nd, strict in [("qtr", Xtr, "NULL", True),
+                                          ("qte", Xte, "'qte'", False)]:
+            maps = _maps_ordered(
+                con, f"SELECT quantile_pred FROM rf_reg_quantile('qm','qtr','y',{lv}, newdata:={nd})")
+            duck_mean = [r[0] for r in con.execute(
+                f"SELECT prediction FROM (SELECT row_number() OVER () __r, prediction "
+                f"FROM rf_reg_predict('qm','{scoretbl}')) ORDER BY __r").fetchall()]
+            q_leaf = skt.apply(Xq.values)
+            sk_mean = skt.predict(Xq.values)
+            checked = 0
+            for i in range(len(Xq)):
+                if abs(duck_mean[i] - sk_mean[i]) > 1e-9:
+                    continue  # trees route this new point to different leaves
+                mask = ref_leaf == q_leaf[i]
+                want = _wquantile_type1(ytr[mask], np.ones(int(mask.sum())), levels)
+                for a in levels:
+                    err = abs(maps[i][a] - want[a])
+                    max_err = max(max_err, err)
+                    assert err < 1e-9, (scoretbl, i, a, maps[i][a], want[a])
+                checked += 1
+            assert checked >= (len(Xq) if strict else 0.6 * len(Xq)), (scoretbl, checked)
+        assert max_err < 1e-9
+
+    def test_monotone_in_level(self, con):
+        Xtr, ytr = _qdata(400, 5, 3)
+        _load(con, "qtr", Xtr.assign(y=ytr))
+        fit_tbl(con, "rf_reg_fit", "qtr", "qm", n_trees=40, seed=5)
+        levels = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+        maps = _maps_ordered(
+            con, f"SELECT quantile_pred FROM rf_reg_quantile('qm','qtr','y',{_lv(levels)})")
+        for m in maps:
+            vals = [m[a] for a in levels]
+            assert all(vals[j] >= vals[j - 1] - 1e-12 for j in range(1, len(vals)))
+            assert m[0.1] - 1e-12 <= m[0.5] <= m[0.9] + 1e-12
+
+    def test_forest_coverage_on_holdout(self, con):
+        # The statistical proof the forest QRF is correct: a [0.05,0.95] band
+        # covers ~90% of held-out y, a [0.1,0.9] band ~80%. y is read back THROUGH
+        # the macro output so it is aligned to the interval by construction.
+        Xtr, ytr = _qdata(1000, 5, 7)
+        Xte, yte = _qdata(400, 5, 8)
+        _load(con, "qtr", Xtr.assign(y=ytr))
+        _load(con, "qte", Xte.assign(y=yte))
+        fit_tbl(con, "rf_reg_fit", "qtr", "qm", n_trees=200, min_samples_leaf=30, seed=9)
+
+        def coverage(lo, hi):
+            rows = con.execute(
+                f"SELECT y, quantile_pred[{lo}] AS a, quantile_pred[{hi}] AS b "
+                f"FROM rf_reg_quantile('qm','qtr','y',{_lv([lo, hi])}, newdata:='qte')").fetchall()
+            return float(np.mean([r[1] <= r[0] <= r[2] for r in rows]))
+
+        c90 = coverage(0.05, 0.95)
+        c80 = coverage(0.1, 0.9)
+        assert 0.85 <= c90 <= 0.95, c90
+        assert 0.75 <= c80 <= 0.88, c80
+
+    def test_median_tracks_mean(self, con):
+        Xtr, ytr = _qdata(700, 5, 11)
+        Xte, yte = _qdata(300, 5, 12)
+        _load(con, "qtr", Xtr.assign(y=ytr))
+        _load(con, "qte", Xte.assign(y=yte))
+        fit_tbl(con, "rf_reg_fit", "qtr", "qm", n_trees=150, seed=15)
+        med = [r[0] for r in con.execute(
+            "SELECT quantile_pred[0.5] FROM (SELECT row_number() OVER () __r, quantile_pred "
+            "FROM rf_reg_quantile('qm','qtr','y',[0.5]::DOUBLE[], newdata:='qte')) ORDER BY __r"
+        ).fetchall()]
+        mean = [r[0] for r in con.execute(
+            "SELECT prediction FROM (SELECT row_number() OVER () __r, prediction "
+            "FROM rf_reg_predict('qm','qte')) ORDER BY __r").fetchall()]
+        assert np.corrcoef(med, mean)[0, 1] > 0.98
+
+    def test_heteroskedastic_width_grows(self, con):
+        rng = np.random.default_rng(31)
+        n, d = 1200, 3
+        X = rng.normal(size=(n, d)) + rng.normal(scale=1e-6, size=(n, d))
+        y = X @ _QBETA[:d] + rng.normal(size=n) * (0.2 + 2.0 * (X[:, 0] - X[:, 0].min()))
+        _load(con, "qh", frame(X).assign(y=y))
+        fit_tbl(con, "rf_reg_fit", "qh", "qhm", n_trees=150, min_samples_leaf=10, seed=3)
+        rows = con.execute(
+            "SELECT x0, quantile_pred[0.9] - quantile_pred[0.1] AS w "
+            "FROM rf_reg_quantile('qhm','qh','y',[0.1, 0.9]::DOUBLE[]) ORDER BY x0").fetchall()
+        x0 = np.array([r[0] for r in rows])
+        w = np.array([r[1] for r in rows])
+        assert np.corrcoef(x0, w)[0, 1] > 0.3
+
+    def test_contract_and_errors(self, con):
+        Xtr, ytr = _qdata(300, 4, 21)
+        _load(con, "qtr", Xtr.assign(y=ytr))
+        fit_tbl(con, "rf_reg_fit", "qtr", "qm", n_trees=30, seed=1)
+        _load(con, "qtc", Xtr.assign(y=(ytr > 0).astype(int).astype(str)))
+        fit_tbl(con, "rf_class_fit", "qtc", "qmc", n_trees=30, seed=1)
+
+        with pytest.raises(DuckDBError, match="classification forest"):
+            df_run(con, "SELECT * FROM rf_reg_quantile('qmc','qtr','y',[0.5]::DOUBLE[])")
+        with pytest.raises(DuckDBError, match="non-empty"):
+            df_run(con, "SELECT * FROM rf_reg_quantile('qm','qtr','y',[]::DOUBLE[])")
+        for bad in ["[0.0, 0.5]", "[0.5, 1.0]"]:
+            with pytest.raises(DuckDBError, match="strictly in"):
+                df_run(con, f"SELECT * FROM rf_reg_quantile('qm','qtr','y',{bad}::DOUBLE[])")
+        with pytest.raises(DuckDBError, match="not found"):
+            df_run(con, "SELECT * FROM rf_reg_quantile('qm','qtr','nope',[0.5]::DOUBLE[])")
+        con.execute("CREATE OR REPLACE TABLE qcol AS SELECT *, 1.0 AS quantile_pred FROM qtr")
+        with pytest.raises(DuckDBError, match="collides"):
+            df_run(con, "SELECT * FROM rf_reg_quantile('qm','qcol','y',[0.5]::DOUBLE[])")
+        _load(con, "__rf_x", Xtr.assign(y=ytr))  # exists, so the guard fires (not a binder error)
+        with pytest.raises(DuckDBError, match="reserved"):
+            df_run(con, "SELECT * FROM rf_reg_quantile('qm','__rf_x','y',[0.5]::DOUBLE[])")
+
+        # newdata := NULL scores tbl itself; an explicit holdout scores that.
+        assert df_run(con, "SELECT count(*) c FROM rf_reg_quantile('qm','qtr','y',[0.5]::DOUBLE[])").c[0] == 300
+        Xte, yte = _qdata(50, 4, 22)
+        _load(con, "qte", Xte.assign(y=yte))
+        assert df_run(con, "SELECT count(*) c FROM rf_reg_quantile('qm','qtr','y',[0.5]::DOUBLE[], newdata:='qte')").c[0] == 50
+
+        # a query row with all features NULL gets a NULL map (predict's contract).
+        dnull = Xte.assign(y=yte)
+        dnull.loc[0, ["x0", "x1", "x2", "x3"]] = np.nan
+        _load(con, "qten", dnull)
+        n_null = df_run(con,
+            "SELECT count(*) c FROM (SELECT quantile_pred FROM "
+            "rf_reg_quantile('qm','qtr','y',[0.5]::DOUBLE[], newdata:='qten')) WHERE quantile_pred IS NULL").c[0]
+        assert n_null >= 1

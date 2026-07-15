@@ -75,7 +75,8 @@ duckdb < tests/smoke.sql
 ## Files
 
 - [rf_macros.sql](rf_macros.sql) — the entire library: both `*_fit` families,
-  `*_predict` / `*_predict_trees` / `*_evaluate`, the out-of-bag macros,
+  `*_predict` / `*_predict_trees` / `*_evaluate`, `rf_reg_quantile`
+  (quantile-regression-forest prediction intervals), the out-of-bag macros,
   `rf_importance`, `rf_permutation_importance`, `rf_summary`, `rf_cv` /
   `rf_cv_depth`, and the shared split-search / scoring core
 - [CHEATSHEET.md](CHEATSHEET.md) — one-page signature reference

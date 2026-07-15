@@ -128,6 +128,29 @@ SELECT CASE
     ELSE error('SMOKE FAIL: OOB output invalid')
   END;
 
+-- ------------------------------------------------ quantile regression forest
+-- A monotone signal with within-leaf spread: x1 bins rows into groups of 20 and
+-- y = 100*bin + spread, so a grown tree isolates each bin into a 20-row leaf.
+-- The QRF quantiles of that leaf must be ordered (q0.1 < q0.5 < q0.9) and the
+-- median must climb with the bin, i.e. track the monotone trend.
+CREATE TABLE qreg AS
+  SELECT (i // 20) AS x1, 100.0 * (i // 20) + (i % 20) AS y FROM range(200) t(i);
+CREATE TABLE qreg_m AS
+  SELECT * FROM rf_reg_fit('qreg', 'y', n_trees := 1, sample_frac := 1.0,
+                           replace_sample := false, mtry := 1, max_depth := NULL);
+WITH q AS (
+  SELECT x1, quantile_pred[0.1] AS q10, quantile_pred[0.5] AS q50, quantile_pred[0.9] AS q90
+  FROM rf_reg_quantile('qreg_m', 'qreg', 'y', [0.1, 0.5, 0.9])
+)
+SELECT CASE
+    WHEN (SELECT bool_and(q10 < q50 AND q50 < q90) FROM q)
+     AND (SELECT count(*) FROM q) = 200
+     AND (SELECT corr(x1, q50) FROM q) > 0.99
+     AND (SELECT min(q50) FROM q WHERE x1 = 9) > (SELECT max(q50) FROM q WHERE x1 = 0)
+    THEN 'PASS  rf_reg_quantile: q0.1 < q0.5 < q0.9 and the median tracks the trend'
+    ELSE error('SMOKE FAIL: rf_reg_quantile intervals/trend wrong')
+  END;
+
 -- ------------------------------------------------------ determinism (threads=1)
 -- Same seed -> bit-identical model; a different seed -> a different model. Compare
 -- the scalar structure columns (list/map columns are equal whenever these are).

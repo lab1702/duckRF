@@ -6,6 +6,7 @@ signature reference see [CHEATSHEET.md](CHEATSHEET.md); for install/setup see th
 
 - [Fitting](#fitting)
 - [Predicting](#predicting)
+- [Prediction intervals (`rf_reg_quantile`)](#prediction-intervals-rf_reg_quantile)
 - [Evaluating](#evaluating)
 - [Out-of-bag](#out-of-bag)
 - [Feature importance](#feature-importance)
@@ -221,6 +222,62 @@ FROM rf_reg_predict_trees('rmodel', 'penguins') WHERE __rf_rid__ = 1;
 -- │ 3499.0 │ 3596.6 │ 3968.0 │
 -- └────────┴────────┴────────┘
 ```
+
+## Prediction intervals (`rf_reg_quantile`)
+
+`rf_reg_predict_trees` above gives the spread of the *ensemble's estimate of the
+mean* — narrow, and it under-covers real observations. For an **honest predictive
+interval** for a new observation, use `rf_reg_quantile`, duckRF's Quantile
+Regression Forest (Meinshausen 2006) and the analogue of duckLM's `*_predict_ci`.
+
+The idea: the conditional distribution of `Y | X = x` is the **weighted empirical
+distribution of the training responses that land in x's leaves** across the
+forest. A training row `i` gets weight `w_i(x) = (1/T) Σ_t 1[leaf_t(x_i) =
+leaf_t(x)] / n_t`, where `n_t` is the number of training rows in x's leaf of tree
+`t`; the weights sum to 1. The level-α prediction is the type-1 inverse CDF of
+that weighted pool — a real quantile of `Y`, not of the ensemble mean.
+
+`rf_reg_quantile(model, tbl, outcome, quantiles, newdata := NULL, ...)` takes the
+**reference sample** `tbl` (normally the training table) whose `outcome` responses
+form the pool, a `DOUBLE[]` of levels in `(0, 1)`, and optional `newdata` to score
+(`NULL` scores `tbl` itself). It returns the scored rows plus `quantile_pred`
+MAP(DOUBLE, DOUBLE) mapping each level to its predicted value. Here the target's
+noise deliberately grows with `x`, and the interval widens to match — uncertainty
+the ensemble-mean spread cannot express:
+
+```sql
+-- y ~ x with heteroskedastic noise whose spread grows with x (deterministic)
+CREATE TABLE demo AS
+  SELECT (i / 100.0) AS x,
+         (i / 100.0) + (((hash(i) % 2001)::BIGINT - 1000) / 1000.0) * (0.2 + i / 100.0) AS y
+  FROM range(1, 601) t(i);
+CREATE TABLE demo_m AS
+  SELECT * FROM rf_reg_fit('demo', 'y', n_trees := 200, min_samples_leaf := 10);
+
+SELECT round(x, 1) AS x,
+       round(quantile_pred[0.05], 2) AS lo,
+       round(quantile_pred[0.5],  2) AS median,
+       round(quantile_pred[0.95], 2) AS hi,
+       round(quantile_pred[0.95] - quantile_pred[0.05], 2) AS width
+FROM rf_reg_quantile('demo_m', 'demo', 'y', [0.05, 0.5, 0.95])
+WHERE x IN (1.0, 3.0, 5.0) ORDER BY x;
+-- ┌─────┬───────┬────────┬──────┬───────┐
+-- │  x  │  lo   │ median │  hi  │ width │
+-- │ 1.0 │ -0.07 │   1.39 │ 2.09 │  2.16 │   -- narrow where noise is small
+-- │ 3.0 │  0.07 │   2.24 │ 5.54 │  5.47 │
+-- │ 5.0 │  0.38 │   3.63 │ 8.75 │  8.38 │   -- wide where noise is large
+-- └─────┴───────┴────────┴──────┴───────┘
+```
+
+Pull a level with `quantile_pred[0.05]`. The `[0.05, 0.95]` band is a genuine 90%
+predictive interval: on held-out data it covers ≈90% of actual observations (a
+`[0.1, 0.9]` band ≈80%). The median tracks `rf_reg_predict`'s mean closely but need
+not equal it. `na_action` and `n_trees` behave exactly as in `rf_reg_predict`; a
+row no tree scored gets a `NULL` map. Cost caveat: it walks **both** the reference
+sample and `newdata` through every tree, so it is heavier than `rf_reg_predict` —
+pass a larger `min_samples_leaf` at fit time (leaves with only a handful of rows
+give poorly-calibrated tails, a known QRF property) and cap the reference sample if
+it is huge.
 
 ## Evaluating
 

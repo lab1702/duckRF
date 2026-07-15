@@ -46,8 +46,10 @@ from sklearn.metrics import (
     r2_score,
     roc_auc_score,
 )
+from sklearn.inspection import permutation_importance
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from scipy.stats import spearmanr
 
 warnings.filterwarnings("ignore")  # silence sklearn solver/deprecation chatter
 
@@ -1209,3 +1211,155 @@ class TestParamGuards:
     def test_reg_criterion_gini_illegal(self, con):
         with pytest.raises(DuckDBError, match="criterion must be 'mse'"):
             df_run(con, "SELECT * FROM rf_reg_fit('tr','y',criterion:='gini')")
+
+
+# ===========================================================================
+# 14. Permutation importance vs sklearn.inspection.permutation_importance
+#
+# The cardinality-unbiased complement to MDI: shuffle a feature's column, watch
+# the model's score (R^2 / accuracy) drop. duckRF's permutation is md5-seeded, not
+# numpy's, so it matches sklearn STATISTICALLY (rank / top-k), not to 1e-9 -- but
+# for the SAME md5 permutation replayed in numpy the per-repeat number is pinned
+# exactly, isolating the only difference from sklearn to the RNG.
+# ===========================================================================
+def _perm_replay_column(values, feat, rep, seed):
+    """Replicate duckRF's md5 shuffle for (feat, rep): the row at destination
+    ordinal i (1..n) receives the value from the row whose md5 key ranks i-th."""
+    n = len(values)
+    keys = [(_md5num(f"{seed}:P:{feat}:{rep}:{i}"), i) for i in range(1, n + 1)]
+    order = sorted(range(n), key=lambda p: keys[p])
+    return np.asarray(values)[order]
+
+
+class TestPermutationImportance:
+    def _perm(self, con, model, tbl, outcome, n_repeats, seed=42):
+        return df_run(con, f"SELECT feature, importance, importance_std FROM "
+                           f"rf_permutation_importance('{model}','{tbl}','{outcome}',"
+                           f" n_repeats:={n_repeats}, seed:={seed})")
+
+    def test_signal_outranks_noise_regression(self, con):
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal((400, 5))
+        y = 3 * X[:, 0] - 2 * X[:, 1] + 0.3 * rng.standard_normal(400)  # x2..x4 noise
+        _load(con, "tr", frame(X).assign(y=y))
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=40, seed=1, max_depth=12)
+        p = self._perm(con, "m", "tr", "y", 12).set_index("feature")["importance"]
+        assert min(p["x0"], p["x1"]) > max(p["x2"], p["x3"], p["x4"])
+        assert max(abs(p["x2"]), abs(p["x3"]), abs(p["x4"])) < 0.05
+        # importance_std is non-negative
+        s = self._perm(con, "m", "tr", "y", 12).set_index("feature")["importance_std"]
+        assert (s >= 0).all()
+
+    def test_signal_outranks_noise_classification(self, con):
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal((500, 5))
+        y = np.where(2.5 * X[:, 0] - 1.5 * X[:, 1] > 0, "pos", "neg")
+        _load(con, "tc", frame(X).assign(y=y))
+        fit_tbl(con, "rf_class_fit", "tc", "mc", n_trees=40, seed=1, max_depth=12)
+        p = self._perm(con, "mc", "tc", "y", 12).set_index("feature")["importance"]
+        assert min(p["x0"], p["x1"]) > max(p["x2"], p["x3"], p["x4"])
+        assert max(abs(p["x2"]), abs(p["x3"]), abs(p["x4"])) < 0.03
+
+    def test_rank_correlates_with_sklearn(self, con):
+        # graded signal on every feature -> a well-defined ranking to correlate.
+        rng = np.random.default_rng(42)
+        n, d = 500, 6
+        X = rng.standard_normal((n, d))
+        y = X @ np.array([3.0, 2.0, 1.2, 0.7, 0.4, 0.2]) + 0.3 * rng.standard_normal(n)
+        _load(con, "tr", frame(X).assign(y=y))
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=60, seed=7, max_depth=14)
+        NR = 25
+        duck = (self._perm(con, "m", "tr", "y", NR).set_index("feature")["importance"]
+                .reindex([f"x{i}" for i in range(d)]).to_numpy())
+        sk = RandomForestRegressor(n_estimators=60, max_depth=14, random_state=7).fit(X, y)
+        skimp = permutation_importance(sk, X, y, n_repeats=NR, random_state=0).importances_mean
+        assert spearmanr(duck, skimp).statistic >= 0.9
+        assert set(np.argsort(duck)[::-1][:3]) == set(np.argsort(skimp)[::-1][:3])
+        # and rank-agrees with duckRF's own MDI on this unbiased (all-numeric) data
+        mdi = (df_run(con, "SELECT feature, importance FROM rf_importance('m')")
+               .set_index("feature")["importance"].reindex([f"x{i}" for i in range(d)]).to_numpy())
+        assert spearmanr(duck, mdi).statistic >= 0.9
+
+    def test_definition_replay_pins_per_repeat(self, con):
+        # SAME md5 permutation replayed in numpy, scored via rf_reg_predict, must
+        # equal duckRF's per-repeat (n_repeats=1) importance to ~1e-9.
+        SEED = 12345
+        rng = np.random.default_rng(1)
+        X = rng.standard_normal((300, 4))
+        y = 2.0 * X[:, 0] - X[:, 1] + 0.5 * X[:, 2] + 0.3 * rng.standard_normal(300)
+        df = frame(X).assign(y=y)
+        _load(con, "tr", df)
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=20, seed=5, max_depth=10)
+        duck1 = self._perm(con, "m", "tr", "y", 1, seed=SEED).set_index("feature")["importance"]
+        yhat = df_run(con, "SELECT prediction FROM rf_reg_predict('m','tr')")["prediction"].to_numpy()
+        yv = df["y"].to_numpy()
+        sst = float(np.sum((yv - yv.mean()) ** 2))
+        r2_base = 1.0 - float(np.sum((yv - yhat) ** 2)) / sst
+        for j, feat in enumerate([f"x{i}" for i in range(4)]):
+            dfp = df.copy()
+            dfp[feat] = _perm_replay_column(X[:, j], feat, 1, SEED)
+            _load(con, "tp", dfp)
+            yhp = df_run(con, "SELECT prediction FROM rf_reg_predict('m','tp')")["prediction"].to_numpy()
+            r2_p = 1.0 - float(np.sum((yv - yhp) ** 2)) / sst
+            assert abs((r2_base - r2_p) - duck1[feat]) < 1e-9
+
+    def test_deterministic_same_seed(self, con):
+        rng = np.random.default_rng(2)
+        X = rng.standard_normal((300, 4))
+        y = 2 * X[:, 0] - X[:, 1] + 0.3 * rng.standard_normal(300)
+        _load(con, "tr", frame(X).assign(y=y))
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=30, seed=1, max_depth=10)
+        a = self._perm(con, "m", "tr", "y", 10, seed=42)
+        b = self._perm(con, "m", "tr", "y", 10, seed=42)
+        assert a.equals(b)  # bit-identical under threads=1
+        d = self._perm(con, "m", "tr", "y", 10, seed=43)
+        assert (np.abs(a["importance"].to_numpy() - d["importance"].to_numpy()) > 1e-12).any()
+
+    def test_lists_every_feature_including_constant(self, con):
+        rng = np.random.default_rng(3)
+        X = rng.standard_normal((300, 4))
+        y = 2 * X[:, 0] - X[:, 1] + 0.3 * rng.standard_normal(300)
+        X[:, 3] = 7.0  # constant -> never split on -> importance exactly 0
+        _load(con, "tr", frame(X).assign(y=y))
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=20, seed=1, max_depth=8)
+        p = self._perm(con, "m", "tr", "y", 8).set_index("feature")["importance"]
+        assert set(p.index) == {"x0", "x1", "x2", "x3"}
+        assert p["x3"] == 0.0
+
+    def test_works_on_holdout_table(self, con):
+        rng = np.random.default_rng(4)
+        X = rng.standard_normal((400, 4))
+        y = 3 * X[:, 0] - X[:, 1] + 0.3 * rng.standard_normal(400)
+        df = frame(X).assign(y=y)
+        _load(con, "trn", df.iloc[:300])
+        _load(con, "hol", df.iloc[300:])
+        fit_tbl(con, "rf_reg_fit", "trn", "m", n_trees=40, seed=1, max_depth=10)
+        p = self._perm(con, "m", "hol", "y", 10).set_index("feature")["importance"]
+        assert p["x0"] > p["x2"] and p["x0"] > p["x3"]
+
+    def test_unknown_outcome_errors(self, con):
+        _load(con, "tr", _reg(80))
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=5)
+        with pytest.raises(DuckDBError, match="not found"):
+            df_run(con, "SELECT * FROM rf_permutation_importance('m','tr','nope')")
+
+    def test_n_repeats_zero_errors(self, con):
+        _load(con, "tr", _reg(81))
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=5)
+        with pytest.raises(DuckDBError, match="n_repeats must be"):
+            df_run(con, "SELECT * FROM rf_permutation_importance('m','tr','y', n_repeats:=0)")
+
+    def test_reserved_table_name_errors(self, con):
+        d = _reg(82)
+        _load(con, "tr", d)
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=5)
+        _load(con, "__rf_bad", d)
+        with pytest.raises(DuckDBError, match="reserved"):
+            df_run(con, "SELECT * FROM rf_permutation_importance('m','__rf_bad','y')")
+
+    def test_empty_model_errors(self, con):
+        _load(con, "tr", _reg(83))
+        fit_tbl(con, "rf_reg_fit", "tr", "m", n_trees=5)
+        con.execute("CREATE OR REPLACE TABLE mempty AS SELECT * FROM m WHERE false")
+        with pytest.raises(DuckDBError, match="empty"):
+            df_run(con, "SELECT * FROM rf_permutation_importance('mempty','tr','y')")

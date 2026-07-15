@@ -42,7 +42,8 @@ Quick taste:
 ```sql
 CREATE TABLE forest AS SELECT * FROM rf_class_fit('penguins', 'species');
 SELECT * FROM rf_class_oob('forest', 'penguins', 'species');   -- honest accuracy, no holdout
-SELECT * FROM rf_importance('forest');                          -- which features matter
+SELECT * FROM rf_importance('forest');                          -- which features matter (MDI)
+SELECT * FROM rf_permutation_importance('forest', 'penguins', 'species');  -- honest, cardinality-unbiased
 ```
 
 ```
@@ -75,8 +76,8 @@ duckdb < tests/smoke.sql
 
 - [rf_macros.sql](rf_macros.sql) — the entire library: both `*_fit` families,
   `*_predict` / `*_predict_trees` / `*_evaluate`, the out-of-bag macros,
-  `rf_importance`, `rf_summary`, `rf_cv` / `rf_cv_depth`, and the shared
-  split-search / scoring core
+  `rf_importance`, `rf_permutation_importance`, `rf_summary`, `rf_cv` /
+  `rf_cv_depth`, and the shared split-search / scoring core
 - [CHEATSHEET.md](CHEATSHEET.md) — one-page signature reference
 - [GUIDE.md](GUIDE.md) — the user's guide
 - [tests/](tests) — pytest suite (vs scikit-learn) and a pure-SQL smoke test

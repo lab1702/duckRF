@@ -88,6 +88,34 @@ SELECT CASE
     ELSE error('SMOKE FAIL: rf_summary / rf_importance shapes wrong')
   END;
 
+-- ------------------------------------------------------ permutation importance
+-- The cardinality-unbiased complement to MDI: shuffling the informative feature
+-- x1 must degrade the model far more than shuffling the pure-noise feature added
+-- here, so x1's permutation importance clearly outranks the noise feature's (and
+-- the noise feature sits near zero). Same-seed runs are bit-identical (threads=1).
+CREATE TABLE perm AS
+  SELECT x1, x2, (x1 * 2654435761) % 97 AS noise, y FROM reg;
+CREATE TABLE perm_m AS SELECT * FROM rf_reg_fit('perm', 'y', n_trees := 30, seed := 5, max_depth := 8);
+SELECT CASE
+    WHEN (SELECT importance FROM rf_permutation_importance('perm_m', 'perm', 'y', n_repeats := 10)
+          WHERE feature = 'x1')
+       > (SELECT importance FROM rf_permutation_importance('perm_m', 'perm', 'y', n_repeats := 10)
+          WHERE feature = 'noise')
+     AND abs((SELECT importance FROM rf_permutation_importance('perm_m', 'perm', 'y', n_repeats := 10)
+              WHERE feature = 'noise')) < 0.05
+     AND (SELECT count(*) FROM rf_permutation_importance('perm_m', 'perm', 'y')) = 3
+     AND (SELECT count(*) FROM (
+            (SELECT * FROM rf_permutation_importance('perm_m', 'perm', 'y', n_repeats := 8, seed := 42)
+             EXCEPT
+             SELECT * FROM rf_permutation_importance('perm_m', 'perm', 'y', n_repeats := 8, seed := 42))
+            UNION ALL
+            (SELECT * FROM rf_permutation_importance('perm_m', 'perm', 'y', n_repeats := 8, seed := 42)
+             EXCEPT
+             SELECT * FROM rf_permutation_importance('perm_m', 'perm', 'y', n_repeats := 8, seed := 42)))) = 0
+    THEN 'PASS  permutation importance: signal x1 outranks noise; deterministic'
+    ELSE error('SMOKE FAIL: permutation importance signal/noise or determinism wrong')
+  END;
+
 -- ------------------------------------------------------------------------- OOB
 -- Out-of-bag runs on the exact training table: scored + excluded == n_train, and
 -- the OOB metrics are finite.

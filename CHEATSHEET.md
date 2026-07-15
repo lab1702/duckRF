@@ -85,13 +85,18 @@ in-bag for every tree.
 
 ```
 rf_importance(model) -> feature, importance    -- MDI, sums to 1, every feature listed
+rf_permutation_importance(model, tbl, outcome, n_repeats := 5, seed := 42)
+                     -> feature, importance, importance_std   -- score drop when column shuffled
+                        (R^2 for regression / accuracy for classification; sklearn-matched,
+                         cardinality-UNBIASED; ordered importance DESC, feature; can be negative)
 rf_summary(model)    -> family, n_trees, n_nodes, n_leaves, max_depth_reached,
                         mean_leaf_depth, depth_cap_hit, n_features, mtry, max_depth,
                         criterion, seed, n_train, sample_frac, replace_sample
 ```
 
-MDI is biased toward high-cardinality features — cross-check with `rf_*_oob` or a
-holdout.
+MDI is biased toward high-cardinality features — prefer `rf_permutation_importance`
+(honest, cardinality-unbiased; score it on a holdout table) for a ranking that
+survives scrutiny.
 
 ## Cross-validation  (min cv_error; folds = (row# − 1) % k)
 

@@ -346,10 +346,52 @@ categoricals) get more chances to split and so accrue importance even when they
 carry little signal. The bias is actually *worse* in duckRF than in sklearn
 precisely because duckRF splits categoricals natively (a many-level categorical
 is one powerful feature here, not a pile of one-hot columns). Treat MDI as a
-quick, in-sample ranking. For an importance measure that survives scrutiny,
-compare model skill **with and without** a feature on a holdout or via
-[`rf_*_oob`](#out-of-bag) (permutation / drop-column importance) — that is the
-honest check.
+quick, in-sample ranking. For an importance measure that survives scrutiny, reach
+for **permutation importance** below.
+
+### Permutation importance (`rf_permutation_importance`)
+
+`rf_permutation_importance(model, tbl, outcome, n_repeats := 5, seed := 42)`
+returns `feature, importance, importance_std` and matches
+`sklearn.inspection.permutation_importance`. It measures how much the model's
+**score degrades when a feature's column is randomly shuffled** on `tbl`: the
+score is the estimator's default `.score()` — **R²** for a regression forest,
+**accuracy** for a classification forest — computed with the normal prediction
+(all trees, soft voting). For feature *j* and repeat *r* it permutes column *j*,
+re-scores, and takes `baseline − permuted`; `importance` is the mean over the
+`n_repeats` repeats and `importance_std` their population standard deviation
+(`np.std`, ddof 0). Rows are the same ones `rf_*_evaluate` scores (every feature
+present, outcome non-NULL), and the shuffle reuses those rows' values, so
+completeness is preserved. Output is ordered by `importance DESC, feature`.
+
+```sql
+SELECT feature, round(importance, 4) AS importance, round(importance_std, 4) AS std
+FROM rf_permutation_importance('cmodel', 'penguins', 'species', n_repeats := 20);
+-- ┌───────────────────┬────────────┬────────┐
+-- │      feature      │ importance │  std   │
+-- │ flipper_length_mm │     0.5123 │ 0.0184 │
+-- │ bill_length_mm    │     0.3011 │ 0.0142 │
+-- │ island            │     0.0208 │ 0.0039 │
+-- │ …                 │        …   │    …   │
+-- └───────────────────┴────────────┴────────┘
+```
+
+**Why prefer it to MDI.** Permutation importance is **not biased by cardinality**:
+a many-level categorical or a high-resolution numeric feature gets no free credit,
+because a feature only scores if shuffling it actually *breaks predictions*. A
+noise feature therefore sits at ~0 — and its importance **can go slightly
+negative** (shuffling happened to help by chance); that sign is real and is kept.
+Score it on a **holdout** table for a leakage-free ranking (it works on any table,
+not just the training set), or on the training table for an in-sample view. Raise
+`n_repeats` to shrink `importance_std`.
+
+Caveats: it costs a full scoring pass per (feature × repeat), so it is heavier
+than MDI; and like sklearn's, it can **split credit between two correlated
+features** (shuffling either alone leaves the other to compensate, so both look
+less important than the pair truly is). The permutation is md5-seeded (this
+library's only randomness), not numpy's, so importances match sklearn
+*statistically* (rank / top-k), not bit-for-bit — but they are **deterministic in
+`seed`** under `PRAGMA threads=1`.
 
 ## Categorical features
 

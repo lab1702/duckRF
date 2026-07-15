@@ -20,7 +20,8 @@
 --   The family tokens differ by three characters on purpose.
 --
 -- Scoring / diagnostics (rf_class_predict, rf_reg_predict, *_evaluate,
--- *_oob*, rf_importance, rf_summary, rf_cv) live further down this file.
+-- *_oob*, rf_importance, rf_permutation_importance, rf_summary, rf_cv) live
+-- further down this file.
 --
 -- Internal helper (do not call directly, subject to change):
 --   __rf_fit(tbl, outcome, family, caller, n_trees, mtry, max_depth,
@@ -899,6 +900,7 @@ SELECT * FROM __rf_fit(tbl, outcome, 'regression', 'rf_reg_fit', n_trees, mtry, 
 --   rf_class_oob_predict(model, tbl) / rf_reg_oob_predict(model, tbl)
 --   rf_class_oob(model, tbl, outcome) / rf_reg_oob(model, tbl, outcome)
 --   rf_importance(model)
+--   rf_permutation_importance(model, tbl, outcome, n_repeats := 5, seed := 42)
 --   rf_summary(model)
 --   rf_cv(tbl, outcome, family, mtry_grid, ...) / rf_cv_depth(...)
 --
@@ -1888,3 +1890,305 @@ CREATE OR REPLACE MACRO rf_cv_depth(tbl, outcome, family, depth_grid, mtry := NU
 SELECT param AS max_depth, cv_error
 FROM __rf_cv(tbl, outcome, family, depth_grid, 'depth', k, n_trees, mtry, NULL,
              min_samples_leaf, sample_frac, seed);
+
+
+-- ---------------------------------------------------------------------------
+-- Permutation feature importance, matching sklearn.inspection.permutation_importance.
+--
+-- The honest, cardinality-UNBIASED complement to MDI (rf_importance): instead of
+-- crediting a feature for the impurity its splits removed at FIT time (which
+-- inflates high-cardinality features -- and worse here, native many-level
+-- categoricals -- because they simply get more chances to split), it measures how
+-- much the model's SCORE on `tbl` degrades when that feature's column is randomly
+-- shuffled. A feature the forest genuinely relies on loses score when broken; a
+-- noise feature does not, so its importance sits at ~0 (and CAN go slightly
+-- negative -- that sign is real and is kept).
+--
+--   rf_permutation_importance(model, tbl, outcome, n_repeats := 5, seed := 42)
+--       -> feature VARCHAR, importance DOUBLE, importance_std DOUBLE
+--   ordered by importance DESC, feature (like rf_importance).
+--
+-- ONE macro serves both families: `family` is read from the model metadata and
+-- the "score" is the estimator's default .score() -- R^2 for a regression forest,
+-- accuracy for a classification forest -- computed with the model's NORMAL
+-- prediction (all trees, soft voting for classification), on exactly the rows
+-- rf_*_evaluate would score: rows with every model feature present AND a non-NULL
+-- (finite, for regression) outcome. Permutation reshuffles values WITHIN that
+-- scored set, so completeness is preserved.
+--
+-- Definition (sklearn-exact): for feature j and repeat r, permute column j across
+-- the scored rows, re-score -> s_{j,r}; per-repeat importance = baseline - s_{j,r}.
+-- Reported importance = mean_r (baseline - s_{j,r}); importance_std = population
+-- std (np.std, ddof=0 -> stddev_pop) of those per-repeat values. Since baseline is
+-- constant, stddev_pop(baseline - s) = stddev_pop(s).
+--
+-- RNG NOTE: the permutation is md5-seeded (this library's only randomness source),
+-- NOT numpy's, so importances match sklearn STATISTICALLY (rank/top-k), not to
+-- 1e-9 -- exactly like every other forest-level check here. Deterministic given
+-- `seed` under PRAGMA threads=1.
+--
+-- Implementation: __rf_walk reads features from query_table(tbl) BY NAME and cannot
+-- be handed a permuted table, so this is a self-contained recursive descent that
+-- carries a JOB dimension. A job is either the baseline (pf = NULL) or one
+-- (feature j, repeat r) with pf = j, rep = r. Every frontier row carries (pf, rep);
+-- at a node splitting on feature c the effective cell is the base cell EXCEPT when
+-- c = pf, where the permuted cell is used (a LEFT JOIN whose match requires
+-- w.pf = split_feature; baseline's pf = NULL never matches -> base values). The
+-- descent uses the SAME branch expression as __rf_walk.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO rf_permutation_importance(model, tbl, outcome,
+                                                  n_repeats := 5, seed := 42) AS TABLE
+WITH RECURSIVE
+-- Forest metadata, constant on every model row (any_value idiom, as __rf_walk).
+__rf_meta AS MATERIALIZED (
+    SELECT any_value(family)        AS family,
+           any_value(features)      AS features,
+           any_value(feature_kinds) AS feature_kinds,
+           any_value(classes)       AS classes,
+           count(*)                 AS n_model_rows
+    FROM query_table(model)
+),
+__rf_mfeat AS MATERIALIZED (
+    SELECT unnest(features) AS col, unnest(feature_kinds) AS kind FROM __rf_meta
+),
+-- Column types of the SCORING table (same discovery trick as __rf_walk: DESCRIBE
+-- does not bind query_table() inside a macro). Only used to recognise BOOLEAN,
+-- whose VARCHAR form is 'true'/'false' and would TRY_CAST to NULL.
+__rf_types AS MATERIALIZED (
+    SELECT colname, typename
+    FROM (SELECT *
+          FROM (SELECT 1 AS __rf_one)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+         UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
+),
+-- ONE VARCHAR long-form of the whole scoring table (features AND the outcome).
+__rf_slong AS MATERIALIZED (
+    SELECT __rf_rid__ AS rid, name AS col, value AS sval
+    FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
+                   FROM query_table(tbl))
+          ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value)
+),
+-- Guards. As elsewhere, a guard only fires if its boolean is REFERENCED, so the
+-- scored-set CTE forces it (upstream) and the final SELECT drives off it (so it
+-- still fires when the scored set is empty, e.g. a missing outcome column). The
+-- outcome is pulled from the tolerant VARCHAR long-form, never COLUMNS(lambda),
+-- so a missing column hits this guard rather than a binder error.
+__rf_chk AS (
+    SELECT CASE
+             WHEN starts_with(lower(tbl), '__rf_') OR starts_with(lower(model), '__rf_')
+               THEN error('rf_permutation_importance: table names beginning with "__rf_" are reserved for internal use; please rename')
+             WHEN (SELECT count(*) FROM __rf_types WHERE starts_with(lower(colname), '__rf_')) > 0
+               THEN error('rf_permutation_importance: column names beginning with "__rf_" are reserved for internal use; please rename')
+             WHEN (SELECT n_model_rows FROM __rf_meta) = 0
+               THEN error('rf_permutation_importance: model table "' || model || '" is empty')
+             WHEN n_repeats < 1
+               THEN error('rf_permutation_importance: n_repeats must be >= 1, got ' || n_repeats)
+             WHEN (SELECT count(*) FROM __rf_types WHERE colname = outcome) = 0
+               THEN error('rf_permutation_importance: outcome column "' || outcome || '" not found in "' || tbl || '"')
+             ELSE true
+           END AS ok
+),
+-- Scoring cells (as __rf_walk): the model's kind decides num vs level; the scoring
+-- table's type only decides the BOOLEAN special case.
+__rf_cells AS MATERIALIZED (
+    SELECT s.rid, f.col, f.kind,
+           CASE WHEN t.typename = 'BOOLEAN' THEN CASE WHEN s.sval = 'true' THEN 1.0 ELSE 0.0 END
+                WHEN f.kind = 'num' THEN TRY_CAST(s.sval AS DOUBLE) END AS v,
+           CASE WHEN f.kind = 'cat' THEN s.sval END AS lv
+    FROM __rf_slong s
+    JOIN __rf_mfeat f ON f.col = s.col
+    JOIN __rf_types t ON t.colname = s.col
+),
+__rf_usable AS MATERIALIZED (
+    SELECT * FROM __rf_cells
+    WHERE (kind = 'num' AND v IS NOT NULL) OR (kind = 'cat' AND lv IS NOT NULL)
+),
+-- Rows with every model feature usable (the 'null' na_action scored set).
+__rf_full AS (
+    SELECT rid FROM __rf_usable
+    GROUP BY rid
+    HAVING count(*) = (SELECT len(features) FROM __rf_meta)
+),
+-- The outcome column via the tolerant long-form: ys = the raw label (VARCHAR,
+-- comparable to the model's classes, which rf_class_fit stored as VARCHAR), yv =
+-- the numeric value for regression. A missing outcome yields no rows here.
+__rf_truth AS (
+    SELECT rid, sval AS ys, TRY_CAST(sval AS DOUBLE) AS yv
+    FROM __rf_slong WHERE col = outcome
+),
+-- The scored set: complete feature rows with a valid outcome, numbered i = 1..n
+-- by row_number() OVER (ORDER BY rid). Everything downstream keys off i. This is
+-- the upstream point that FORCES __rf_chk (CROSS JOIN ... WHERE ck.ok).
+__rf_scored AS MATERIALIZED (
+    SELECT f.rid, row_number() OVER (ORDER BY f.rid) AS i
+    FROM __rf_full f
+    JOIN __rf_truth tr ON tr.rid = f.rid
+    CROSS JOIN __rf_chk ck
+    WHERE ck.ok
+      AND ((SELECT family FROM __rf_meta) = 'classification' OR isfinite(tr.yv))
+),
+__rf_srows AS (SELECT i FROM __rf_scored),
+-- Base feature cells over the scored set, keyed by the scored ordinal i.
+__rf_base AS MATERIALIZED (
+    SELECT sc.i, u.col, u.v, u.lv
+    FROM __rf_usable u JOIN __rf_scored sc ON sc.rid = u.rid
+),
+-- Outcome per scored ordinal (uncentered y for R^2, label for accuracy).
+__rf_yset AS MATERIALIZED (
+    SELECT sc.i AS rid, tr.ys, tr.yv
+    FROM __rf_scored sc JOIN __rf_truth tr ON tr.rid = sc.rid
+),
+-- SST for R^2 (constant across jobs): ybar = mean y over the scored set.
+__rf_ybar AS (SELECT avg(yv) AS ybar FROM __rf_yset),
+__rf_sst AS (SELECT sum((yv - (SELECT ybar FROM __rf_ybar)) * (yv - (SELECT ybar FROM __rf_ybar))) AS sst
+             FROM __rf_yset),
+-- Jobs: one per (feature, repeat). Baseline is added to the job set below.
+__rf_jobs AS (
+    SELECT f.col AS pf, r.rep::INTEGER AS rep
+    FROM __rf_mfeat f
+    CROSS JOIN (SELECT unnest(range(1, n_repeats + 1)) AS rep) r
+),
+__rf_jobset AS (
+    SELECT NULL::VARCHAR AS pf, NULL::INTEGER AS rep
+    UNION ALL
+    SELECT pf, rep FROM __rf_jobs
+),
+-- The permutation, "shuffle by sorting on a random key" (fixed points are fine,
+-- as numpy's permutation has them too). For each (feature, repeat): identity
+-- position ipos = i; shuffle position spos ranks i by md5_number(seed:P:...). The
+-- row at identity position p receives feature pf's value from the row at shuffle
+-- position p. The md5 key ties break on i so the order is fully deterministic.
+__rf_perm AS (
+    SELECT j.pf, j.rep, s.i,
+           row_number() OVER (PARTITION BY j.pf, j.rep ORDER BY s.i) AS ipos,
+           row_number() OVER (PARTITION BY j.pf, j.rep
+                              ORDER BY md5_number(seed || ':P:' || j.pf || ':' || j.rep || ':' || s.i), s.i) AS spos
+    FROM __rf_jobs j CROSS JOIN __rf_srows s
+),
+__rf_permmap AS (
+    SELECT a.pf, a.rep, a.i AS dest_i, b.i AS src_i
+    FROM __rf_perm a JOIN __rf_perm b ON a.pf = b.pf AND a.rep = b.rep AND a.ipos = b.spos
+),
+-- The permuted cell of feature pf at destination row i = pf's base cell at the
+-- shuffle partner row. Exactly d * n_repeats * n rows.
+__rf_permcell AS MATERIALIZED (
+    SELECT pm.pf, pm.rep, pm.dest_i AS i, base.v, base.lv
+    FROM __rf_permmap pm
+    JOIN __rf_base base ON base.i = pm.src_i AND base.col = pm.pf
+),
+-- Model nodes (all trees; permutation importance is NOT out-of-bag).
+__rf_nodes AS MATERIALIZED (SELECT * FROM query_table(model)),
+__rf_treelist AS (SELECT DISTINCT tree FROM __rf_nodes),
+__rf_int AS MATERIALIZED (
+    SELECT tree, node, split_feature, split_kind, threshold, cats_left, cats_right, unseen_left
+    FROM __rf_nodes WHERE NOT is_leaf
+),
+__rf_leaf AS MATERIALIZED (
+    SELECT tree, node, prediction, class_counts FROM __rf_nodes WHERE is_leaf
+),
+-- The descent: seed every (job, scored row, tree) at node 1, then descend. At a
+-- node the effective cell is the base cell, EXCEPT when the split feature is this
+-- job's permuted feature (the LEFT JOIN matches only then). Baseline (pf = NULL)
+-- never matches -> base cells. Same three-way categorical rule as __rf_walk.
+__rf_w AS (
+    SELECT j.pf, j.rep, s.i AS rid, t.tree, 1::BIGINT AS node
+    FROM __rf_jobset j
+    CROSS JOIN __rf_srows s
+    CROSS JOIN __rf_treelist t
+    CROSS JOIN __rf_chk ck
+    WHERE ck.ok
+  UNION ALL
+    SELECT w.pf, w.rep, w.rid, w.tree,
+           w.node * 2 + CASE WHEN i.split_kind = 'num'
+                             THEN CASE WHEN coalesce(pc.v, b.v) <= i.threshold THEN 0 ELSE 1 END
+                             ELSE CASE WHEN list_contains(i.cats_left,  coalesce(pc.lv, b.lv)) THEN 0
+                                       WHEN list_contains(i.cats_right, coalesce(pc.lv, b.lv)) THEN 1
+                                       WHEN i.unseen_left                                       THEN 0
+                                       ELSE 1 END
+                        END AS node
+    FROM __rf_w w
+    JOIN __rf_int i ON i.tree = w.tree AND i.node = w.node
+    JOIN __rf_base b ON b.i = w.rid AND b.col = i.split_feature
+    LEFT JOIN __rf_permcell pc ON pc.pf = w.pf AND pc.rep = w.rep
+                              AND pc.i = w.rid AND pc.pf = i.split_feature
+),
+__rf_landed AS (
+    SELECT w.pf, w.rep, w.rid, w.tree, l.prediction, l.class_counts
+    FROM __rf_w w JOIN __rf_leaf l ON l.tree = w.tree AND l.node = w.node
+),
+-- Aggregate to a forest prediction per (job, row). Regression: mean leaf value.
+-- Classification: soft vote (mean of normalized leaf distributions), argmax with
+-- ties to the smallest label -- exactly rf_class_predict.
+--
+-- DETERMINISM: every floating SUM below is an ORDERED sum
+-- (list_sum(list(x ORDER BY key))), never a bare avg()/sum(). DuckDB's hash
+-- aggregation accumulates a group's rows in an order that is not stable run to
+-- run (even under threads=1), and float addition is non-associative, so a bare
+-- avg() jitters by ~1 ULP between runs and "same seed => identical table" would
+-- fail. Summing in a fixed key order (tree, then rid, then rep) makes the result
+-- bit-identical. The sort keys are unique within each group, so the order is
+-- total and reproducible.
+__rf_regpred AS (
+    SELECT pf, rep, rid, list_sum(list(prediction ORDER BY tree)) / count(*) AS yhat
+    FROM __rf_landed GROUP BY pf, rep, rid
+),
+__rf_clsprob AS (
+    SELECT pf, rep, rid, cls, list_sum(list(pp ORDER BY tree)) / count(*) AS p
+    FROM (SELECT pf, rep, rid, tree,
+                 unnest(map_keys(class_counts))   AS cls,
+                 unnest(map_values(class_counts)) / list_sum(map_values(class_counts)) AS pp
+          FROM __rf_landed)
+    GROUP BY pf, rep, rid, cls
+),
+__rf_clspred AS (
+    SELECT pf, rep, rid, (list(cls ORDER BY p DESC, cls))[1] AS pred
+    FROM __rf_clsprob GROUP BY pf, rep, rid
+),
+-- Score per job. Regression R^2 = 1 - SSE/SST (NULL if SST = 0), SSE summed in
+-- rid order. Classification accuracy = mean[pred = y] (a sum of 0/1 ints, exact
+-- and order-independent). Only the model's family produces rows (the other
+-- branch's predictions are all-NULL / empty and are filtered out here).
+__rf_regscore AS (
+    SELECT p.pf, p.rep,
+           CASE WHEN (SELECT sst FROM __rf_sst) = 0 THEN NULL
+                ELSE 1.0 - list_sum(list((y.yv - p.yhat) * (y.yv - p.yhat) ORDER BY p.rid))
+                           / (SELECT sst FROM __rf_sst) END AS score
+    FROM __rf_regpred p JOIN __rf_yset y ON y.rid = p.rid
+    GROUP BY p.pf, p.rep
+),
+__rf_clsscore AS (
+    SELECT p.pf, p.rep, avg((p.pred = y.ys)::INT) AS score
+    FROM __rf_clspred p JOIN __rf_yset y ON y.rid = p.rid
+    GROUP BY p.pf, p.rep
+),
+__rf_score AS (
+    SELECT pf, rep, score FROM __rf_regscore WHERE (SELECT family FROM __rf_meta) = 'regression'
+    UNION ALL
+    SELECT pf, rep, score FROM __rf_clsscore WHERE (SELECT family FROM __rf_meta) = 'classification'
+),
+__rf_baseline AS (SELECT any_value(score) AS baseline FROM __rf_score WHERE pf IS NULL),
+-- Reduce: per-repeat importance = baseline - s_{j,r}; report mean and pop std.
+-- Every model feature appears (a never-split feature permutes to the baseline
+-- score, so importance = 0). Mean and stddev_pop are again ORDERED sums (over
+-- rep) for run-to-run bit-identity.
+__rf_imprep AS (
+    SELECT pf, rep, (SELECT baseline FROM __rf_baseline) - score AS imp
+    FROM __rf_score WHERE pf IS NOT NULL
+),
+__rf_impmean AS (
+    SELECT pf, list_sum(list(imp ORDER BY rep)) / count(*) AS mean_imp, count(*) AS nr
+    FROM __rf_imprep GROUP BY pf
+),
+__rf_out AS (
+    SELECT i.pf AS feature, m.mean_imp AS importance,
+           sqrt(list_sum(list((i.imp - m.mean_imp) * (i.imp - m.mean_imp) ORDER BY i.rep)) / m.nr)
+             AS importance_std
+    FROM __rf_imprep i JOIN __rf_impmean m ON m.pf = i.pf
+    GROUP BY i.pf, m.mean_imp, m.nr
+)
+-- Drive off __rf_chk so the guards fire even when the scored set is empty (e.g. a
+-- missing outcome column makes __rf_out empty); __rf_chk always yields one row.
+SELECT o.feature, o.importance, o.importance_std
+FROM __rf_chk ck LEFT JOIN __rf_out o ON true
+WHERE ck.ok AND o.feature IS NOT NULL
+ORDER BY o.importance DESC, o.feature;

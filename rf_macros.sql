@@ -301,6 +301,14 @@ CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
 );
 
 
+-- Detect unrepresentable intermediate moments before they can become model rows.
+CREATE OR REPLACE MACRO __rf_moment_ok(vec, crit, caller) AS
+    CASE WHEN crit = 'mse' AND
+                   (len(list_filter(vec, lambda x: NOT isfinite(x))) > 0
+                    OR NOT isfinite(__rf_imp(vec, crit)))
+         THEN error(caller || ': regression moment overflow; rescale outcomes or sample weights')
+         ELSE true END;
+
 CREATE OR REPLACE MACRO __rf_fit(tbl, outcome, family, caller, n_trees, mtry, max_depth,
                                  min_samples_split, min_samples_leaf, min_impurity_decrease,
                                  sample_frac, replace_sample, criterion, seed,
@@ -710,6 +718,7 @@ __rf_tr AS (
                __rf_q(v.pvec, criterion)   AS qpar
         FROM ns JOIN nvec v ON v.tree = ns.tree AND v.node = ns.node
         LEFT JOIN ncenter nc ON nc.tree = ns.tree AND nc.node = ns.node
+        WHERE __rf_moment_ok(v.pvec, criterion, caller)
      ),
      -- Splittable nodes. The purity test is on the NORMALIZED impurity against
      -- DBL_EPSILON, exactly as sklearn's (impurity <= EPSILON); comparing a
@@ -1198,15 +1207,15 @@ CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100,
              || ', tree_to := ' || least(g.i * batch_size, n_trees)
              || ', mtry := ' || coalesce(mtry::VARCHAR, 'NULL')
              || ', max_depth := ' || coalesce(max_depth::VARCHAR, 'NULL')
-             || ', min_samples_split := ' || min_samples_split
-             || ', min_samples_leaf := ' || min_samples_leaf
-             || ', min_impurity_decrease := ' || min_impurity_decrease
-             || ', sample_frac := ' || sample_frac
+             || ', min_samples_split := ' || coalesce(min_samples_split::VARCHAR, 'NULL')
+             || ', min_samples_leaf := ' || coalesce(min_samples_leaf::VARCHAR, 'NULL')
+             || ', min_impurity_decrease := ' || coalesce(min_impurity_decrease::VARCHAR, 'NULL')
+             || ', sample_frac := ' || coalesce(sample_frac::VARCHAR, 'NULL')
              || ', replace_sample := ' || CASE WHEN replace_sample IS NULL THEN 'NULL' WHEN replace_sample THEN 'true' ELSE 'false' END
              || ', criterion := ' || __rf_quote((SELECT crit FROM __rf_bcfg))
-             || ', seed := ' || seed
+             || ', seed := ' || coalesce(seed::VARCHAR, 'NULL')
              || ', weights_col := ' || coalesce(__rf_quote(weights_col), 'NULL')
-             || ', splitter := ' || __rf_quote(splitter)
+             || ', splitter := ' || coalesce(__rf_quote(splitter), 'NULL')
              || CASE WHEN family = 'classification'
                      THEN ', class_weight := ' || coalesce(__rf_quote(class_weight), 'NULL')
                      ELSE '' END
@@ -1221,10 +1230,10 @@ CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100,
            WHEN family IS NULL OR family NOT IN ('classification', 'regression')
              THEN error('rf_batched_fit_sql: family must be ''classification'' or ''regression'', got '''
                         || coalesce(family, 'NULL') || '''')
-           WHEN n_trees < 1
-             THEN error('rf_batched_fit_sql: n_trees must be >= 1, got ' || n_trees)
-           WHEN batch_size < 1
-             THEN error('rf_batched_fit_sql: batch_size must be >= 1, got ' || batch_size)
+           WHEN n_trees IS NULL OR n_trees < 1
+             THEN error('rf_batched_fit_sql: n_trees must be >= 1, got ' || coalesce(n_trees::VARCHAR, 'NULL'))
+           WHEN batch_size IS NULL OR batch_size < 1
+             THEN error('rf_batched_fit_sql: batch_size must be >= 1, got ' || coalesce(batch_size::VARCHAR, 'NULL'))
            ELSE (SELECT arms FROM __rf_barms)
          END
 );
@@ -1377,7 +1386,7 @@ __rf_chk AS (
              WHEN na_action IS NULL OR na_action NOT IN ('null', 'skip_tree')
                THEN error(caller || ': na_action must be ''null'' or ''skip_tree'', got ''' || coalesce(na_action, 'NULL') || '''')
              WHEN n_trees IS NOT NULL AND n_trees < 1
-               THEN error(caller || ': n_trees must be >= 1 (or NULL for every tree), got ' || n_trees)
+               THEN error(caller || ': n_trees must be >= 1 (or NULL for every tree), got ' || coalesce(n_trees::VARCHAR, 'NULL'))
              ELSE true
            END AS ok
 ),
@@ -1952,7 +1961,7 @@ FROM query_table(model);
 CREATE OR REPLACE MACRO __rf_cv(tbl, outcome, family, grid, sweep, k, n_trees, mtry_fixed,
                                 max_depth_fixed, min_samples_leaf, sample_frac, seed) AS TABLE
 WITH RECURSIVE
-__cv_types AS MATERIALIZED (
+__rf_cv_types AS MATERIALIZED (
     SELECT colname, typename,
            CASE WHEN typename IN ('BOOLEAN','TINYINT','SMALLINT','INTEGER','BIGINT','HUGEINT',
                                   'UTINYINT','USMALLINT','UINTEGER','UBIGINT','UHUGEINT','FLOAT','DOUBLE')
@@ -1962,51 +1971,54 @@ __cv_types AS MATERIALIZED (
           LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
-__cv_slong AS MATERIALIZED (
+__rf_cv_slong AS MATERIALIZED (
     SELECT __rf_rid__ AS rid, name AS col, value AS sval
     FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl))
           ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value)
 ),
-__cv_featcols AS MATERIALIZED (
-    SELECT colname AS col, kind FROM __cv_types WHERE colname != outcome
+__rf_cv_featcols AS MATERIALIZED (
+    SELECT colname AS col, kind FROM __rf_cv_types WHERE colname != outcome
 ),
-__cv_d AS (SELECT count(*)::BIGINT AS d FROM __cv_featcols),
-__cv_complete AS MATERIALIZED (
-    SELECT rid FROM __cv_slong GROUP BY rid HAVING count(*) = (SELECT count(*) FROM __cv_types)
+__rf_cv_d AS (SELECT count(*)::BIGINT AS d FROM __rf_cv_featcols),
+__rf_cv_complete AS MATERIALIZED (
+    SELECT rid FROM __rf_cv_slong GROUP BY rid HAVING count(*) = (SELECT count(*) FROM __rf_cv_types)
 ),
-__cv_chk AS (
+__rf_cv_chk AS (
     SELECT CASE
              WHEN family IS NULL OR family NOT IN ('classification', 'regression')
                THEN error('rf_cv: family must be ''classification'' or ''regression'', got ''' || coalesce(family, 'NULL') || '''')
-             WHEN (SELECT count(*) FROM __cv_featcols WHERE kind IS NULL) > 0
+             WHEN starts_with(lower(tbl), '__rf_')
+                  OR (SELECT count(*) FROM __rf_cv_types WHERE starts_with(lower(colname), '__rf_')) > 0
+               THEN error('rf_cv: table and column names beginning with __rf_ are reserved')
+             WHEN (SELECT count(*) FROM __rf_cv_featcols WHERE kind IS NULL) > 0
                THEN error('rf_cv: unsupported feature type: ' ||
                           (SELECT string_agg(colname || ' (' || typename || ')', ', ')
-                           FROM __cv_types WHERE colname != outcome AND kind IS NULL))
-             WHEN family = 'regression' AND (SELECT kind FROM __cv_types WHERE colname = outcome) != 'num'
+                           FROM __rf_cv_types WHERE colname != outcome AND kind IS NULL))
+             WHEN family = 'regression' AND (SELECT kind FROM __rf_cv_types WHERE colname = outcome) != 'num'
                THEN error('rf_cv: regression outcome must be numeric')
-             WHEN (SELECT count(*) FROM __cv_slong s
-                   JOIN __cv_types t ON t.colname = s.col
-                   SEMI JOIN __cv_complete c ON c.rid = s.rid
+             WHEN (SELECT count(*) FROM __rf_cv_slong s
+                   JOIN __rf_cv_types t ON t.colname = s.col
+                   SEMI JOIN __rf_cv_complete c ON c.rid = s.rid
                    WHERE t.kind = 'num' AND (s.col != outcome OR family = 'regression')
                      AND NOT isfinite(__rf_number(s.sval, t.typename))) > 0
                THEN error('rf_cv: numeric training cells contain NaN or Inf')
              WHEN k IS NULL OR k < 2 THEN error('rf_cv: k must be >= 2')
-             WHEN k > (SELECT count(*) FROM __cv_complete)
+             WHEN k > (SELECT count(*) FROM __rf_cv_complete)
                THEN error('rf_cv: k must not exceed the number of complete rows')
              WHEN grid IS NULL OR len(grid) < 1 THEN error('rf_cv: grid must be non-empty')
              WHEN len(list_filter(grid, lambda x: x IS NULL)) > 0
                THEN error('rf_cv: grid values must not be NULL')
              WHEN sweep = 'mtry' AND list_aggregate(grid, 'min') < 1
                THEN error('rf_cv: every mtry must be >= 1')
-             WHEN sweep = 'mtry' AND list_aggregate(grid, 'max') > (SELECT d FROM __cv_d)
-               THEN error('rf_cv: mtry must not exceed the number of features (' || (SELECT d FROM __cv_d) || ')')
+             WHEN sweep = 'mtry' AND list_aggregate(grid, 'max') > (SELECT d FROM __rf_cv_d)
+               THEN error('rf_cv: mtry must not exceed the number of features (' || (SELECT d FROM __rf_cv_d) || ')')
              WHEN sweep = 'depth' AND list_aggregate(grid, 'min') < 1
                THEN error('rf_cv: every max_depth must be >= 1')
              WHEN sweep = 'depth' AND list_aggregate(grid, 'max') > 60
                THEN error('rf_cv: every max_depth must be <= 60')
              WHEN max_depth_fixed IS NOT NULL AND (max_depth_fixed < 1 OR max_depth_fixed > 60)
                THEN error('rf_cv: max_depth must be between 1 and 60, or NULL')
-             WHEN mtry_fixed IS NOT NULL AND (mtry_fixed < 1 OR mtry_fixed > (SELECT d FROM __cv_d))
+             WHEN mtry_fixed IS NOT NULL AND (mtry_fixed < 1 OR mtry_fixed > (SELECT d FROM __rf_cv_d))
                THEN error('rf_cv: mtry must be between 1 and the number of features')
              WHEN sample_frac IS NULL OR NOT isfinite(sample_frac) OR sample_frac <= 0 OR sample_frac > 1
                THEN error('rf_cv: sample_frac must be in (0, 1]')
@@ -2014,100 +2026,100 @@ __cv_chk AS (
                THEN error('rf_cv: min_samples_leaf must be >= 1')
              WHEN seed IS NULL THEN error('rf_cv: seed must not be NULL')
              WHEN n_trees IS NULL OR n_trees < 1 THEN error('rf_cv: n_trees must be >= 1')
-             WHEN (SELECT count(*) FROM __cv_complete) = 0 THEN error('rf_cv: no complete rows')
+             WHEN (SELECT count(*) FROM __rf_cv_complete) = 0 THEN error('rf_cv: no complete rows')
              ELSE true END AS ok
 ),
-__cv_rows AS MATERIALIZED (
+__rf_cv_rows AS MATERIALIZED (
     SELECT c.rid, row_number() OVER (ORDER BY c.rid) AS i,
            (row_number() OVER (ORDER BY c.rid) - 1) % k AS fold
-    FROM __cv_complete c CROSS JOIN __cv_chk ck WHERE ck.ok
+    FROM __rf_cv_complete c CROSS JOIN __rf_cv_chk ck WHERE ck.ok
 ),
-__cv_ysval AS MATERIALIZED (
+__rf_cv_ysval AS MATERIALIZED (
     SELECT r.i AS rid, s.sval AS cls,
-           __rf_number(s.sval, (SELECT typename FROM __cv_types WHERE colname = outcome)) AS yv
-    FROM __cv_slong s JOIN __cv_rows r ON r.rid = s.rid WHERE s.col = outcome
+           __rf_number(s.sval, (SELECT typename FROM __rf_cv_types WHERE colname = outcome)) AS yv
+    FROM __rf_cv_slong s JOIN __rf_cv_rows r ON r.rid = s.rid WHERE s.col = outcome
 ),
-__cv_y AS MATERIALIZED (
-    SELECT rid, cls, yv FROM __cv_ysval
+__rf_cv_y AS MATERIALIZED (
+    SELECT rid, cls, yv FROM __rf_cv_ysval
 ),
-__cv_classes AS MATERIALIZED (
+__rf_cv_classes AS MATERIALIZED (
     SELECT cls, row_number() OVER (ORDER BY cls) AS kk
-    FROM (SELECT DISTINCT cls FROM __cv_ysval) WHERE family = 'classification'
+    FROM (SELECT DISTINCT cls FROM __rf_cv_ysval) WHERE family = 'classification'
 ),
-__cv_classlist AS (SELECT list(cls ORDER BY kk) AS classes FROM __cv_classes),
-__cv_slots AS MATERIALIZED (
-    SELECT kk AS slot FROM __cv_classes
+__rf_cv_classlist AS (SELECT list(cls ORDER BY kk) AS classes FROM __rf_cv_classes),
+__rf_cv_slots AS MATERIALIZED (
+    SELECT kk AS slot FROM __rf_cv_classes
     UNION ALL SELECT unnest([1,2,3]) WHERE family = 'regression'
 ),
-__cv_crit AS (SELECT CASE WHEN family = 'classification' THEN 'gini' ELSE 'mse' END AS crit),
-__cv_u AS MATERIALIZED (
+__rf_cv_crit AS (SELECT CASE WHEN family = 'classification' THEN 'gini' ELSE 'mse' END AS crit),
+__rf_cv_u AS MATERIALIZED (
     SELECT y.rid, c.kk AS slot, 1.0::DOUBLE AS u
-    FROM __cv_y y JOIN __cv_classes c ON c.cls = y.cls
+    FROM __rf_cv_y y JOIN __rf_cv_classes c ON c.cls = y.cls
 
 ),
-__cv_feat AS MATERIALIZED (
+__rf_cv_feat AS MATERIALIZED (
     SELECT r.i AS rid, s.col, f.kind,
-           CASE WHEN f.kind = 'num' AND (SELECT typename FROM __cv_types t WHERE t.colname = s.col) = 'BOOLEAN'
+           CASE WHEN f.kind = 'num' AND (SELECT typename FROM __rf_cv_types t WHERE t.colname = s.col) = 'BOOLEAN'
                      THEN CASE WHEN s.sval = 'true' THEN 1.0 ELSE 0.0 END
                 WHEN f.kind = 'num' THEN TRY_CAST(s.sval AS DOUBLE) END AS v,
            CASE WHEN f.kind = 'cat' THEN s.sval END AS lv
-    FROM __cv_slong s JOIN __cv_rows r ON r.rid = s.rid JOIN __cv_featcols f ON f.col = s.col
+    FROM __rf_cv_slong s JOIN __rf_cv_rows r ON r.rid = s.rid JOIN __rf_cv_featcols f ON f.col = s.col
 ),
 -- Groups: g = (grid_index-1)*k + held_fold. mtry / max_depth per group.
-__cv_groups AS MATERIALIZED (
+__rf_cv_groups AS MATERIALIZED (
     SELECT (gi.g - 1) * k + hf.hf AS g, gi.g AS gidx, hf.hf AS held,
            CASE WHEN sweep = 'mtry' THEN grid[gi.g]
                 ELSE coalesce(mtry_fixed, CASE WHEN family = 'classification'
-                                               THEN greatest(1, floor(sqrt((SELECT d FROM __cv_d))))
-                                               ELSE (SELECT d FROM __cv_d) END) END::BIGINT AS mtry_g,
+                                               THEN greatest(1, floor(sqrt((SELECT d FROM __rf_cv_d))))
+                                               ELSE (SELECT d FROM __rf_cv_d) END) END::BIGINT AS mtry_g,
            CASE WHEN sweep = 'depth' THEN grid[gi.g] ELSE coalesce(max_depth_fixed, 60) END::BIGINT AS depth_g
     FROM range(1, len(grid)+1) gi(g) CROSS JOIN range(0, k) hf(hf)
 ),
 -- Training rows within each group, renumbered 1..m_g for the bootstrap draw.
-__cv_train AS MATERIALIZED (
+__rf_cv_train AS MATERIALIZED (
     SELECT g.g, r.i AS i, row_number() OVER (PARTITION BY g.g ORDER BY r.i) AS j
-    FROM __cv_groups g JOIN __cv_rows r ON r.fold != g.held
+    FROM __rf_cv_groups g JOIN __rf_cv_rows r ON r.fold != g.held
 ),
-__cv_mg AS MATERIALIZED (SELECT g, count(*)::BIGINT AS mg FROM __cv_train GROUP BY g),
-__cv_trees AS (SELECT unnest(range(1, n_trees+1))::INTEGER AS tree),
-__cv_boot AS MATERIALIZED (
+__rf_cv_mg AS MATERIALIZED (SELECT g, count(*)::BIGINT AS mg FROM __rf_cv_train GROUP BY g),
+__rf_cv_trees AS (SELECT unnest(range(1, n_trees+1))::INTEGER AS tree),
+__rf_cv_boot AS MATERIALIZED (
     SELECT b.g, b.tree, tr.i AS rid, count(*)::DOUBLE AS w
     FROM (
         SELECT g.g, t.tree, d.j
-        FROM __cv_groups g CROSS JOIN __cv_trees t
+        FROM __rf_cv_groups g CROSS JOIN __rf_cv_trees t
         CROSS JOIN LATERAL (
             SELECT (md5_number(seed || ':cv:' || g.g || ':' || t.tree || ':' || kk.kk)
-                    % (SELECT mg FROM __cv_mg m WHERE m.g = g.g)::UHUGEINT)::BIGINT + 1 AS j
-            FROM range(1, greatest(1, ceil(sample_frac * (SELECT mg FROM __cv_mg m WHERE m.g = g.g)))::BIGINT + 1) kk(kk)
+                    % (SELECT mg FROM __rf_cv_mg m WHERE m.g = g.g)::UHUGEINT)::BIGINT + 1 AS j
+            FROM range(1, greatest(1, ceil(sample_frac * (SELECT mg FROM __rf_cv_mg m WHERE m.g = g.g)))::BIGINT + 1) kk(kk)
         ) d
     ) b
-    JOIN __cv_train tr ON tr.g = b.g AND tr.j = b.j
+    JOIN __rf_cv_train tr ON tr.g = b.g AND tr.j = b.j
     GROUP BY b.g, b.tree, tr.i
 ),
-__cv_wroot AS MATERIALIZED (SELECT g, tree, sum(w) AS w_root FROM __cv_boot GROUP BY g, tree),
+__rf_cv_wroot AS MATERIALIZED (SELECT g, tree, sum(w) AS w_root FROM __rf_cv_boot GROUP BY g, tree),
 
 -- ===== build all trees for all groups, breadth-first =====
-__cv_tr AS (
+__rf_cv_tr AS (
     SELECT 'assign' AS tag, b.g, b.tree, 1::BIGINT AS node, 0::INTEGER AS depth, b.rid, b.w,
            NULL::STRUCT(col VARCHAR, kind VARCHAR, thr DOUBLE, cats_left VARCHAR[],
                         cats_right VARCHAR[], unseen_left BOOLEAN, pred DOUBLE, cc MAP(VARCHAR, DOUBLE)) AS m
-    FROM __cv_boot b
+    FROM __rf_cv_boot b
   UNION ALL
     (
-     WITH cur AS (SELECT g, tree, node, depth, rid, w FROM __cv_tr WHERE tag = 'assign'),
+     WITH cur AS (SELECT g, tree, node, depth, rid, w FROM __rf_cv_tr WHERE tag = 'assign'),
      ncenter AS (
         SELECT c.g, c.tree, c.node, first(y.yv ORDER BY c.rid) AS center
-        FROM cur c JOIN __cv_y y ON y.rid=c.rid
+        FROM cur c JOIN __rf_cv_y y ON y.rid=c.rid
         WHERE family='regression' GROUP BY c.g,c.tree,c.node
      ),
      nu AS (
         SELECT c.g,c.tree,c.node,c.rid,u.slot,u.u
-        FROM cur c JOIN __cv_u u ON u.rid=c.rid
+        FROM cur c JOIN __rf_cv_u u ON u.rid=c.rid
         UNION ALL
         SELECT c.g,c.tree,c.node,c.rid,sl.slot,
                CASE sl.slot WHEN 1 THEN 1.0 WHEN 2 THEN y.yv-nc.center
                     ELSE (y.yv-nc.center)*(y.yv-nc.center) END AS u
-        FROM cur c JOIN __cv_y y ON y.rid=c.rid
+        FROM cur c JOIN __rf_cv_y y ON y.rid=c.rid
         JOIN ncenter nc ON nc.g=c.g AND nc.tree=c.tree AND nc.node=c.node
         CROSS JOIN (SELECT unnest([1,2,3]) AS slot) sl
      ),
@@ -2116,18 +2128,19 @@ __cv_tr AS (
      ns AS (SELECT g, tree, node, any_value(depth) AS depth, count(*) AS nrows, sum(w) AS wn
             FROM cur GROUP BY g, tree, node),
      nvec AS (SELECT gg.g, gg.tree, gg.node, list(coalesce(x.s,0.0) ORDER BY gg.slot) AS pvec
-              FROM (SELECT n.g, n.tree, n.node, s.slot FROM ns n CROSS JOIN __cv_slots s) gg
+              FROM (SELECT n.g, n.tree, n.node, s.slot FROM ns n CROSS JOIN __rf_cv_slots s) gg
               LEFT JOIN nsl x ON x.g=gg.g AND x.tree=gg.tree AND x.node=gg.node AND x.slot=gg.slot
               GROUP BY gg.g, gg.tree, gg.node),
-     nstat AS (SELECT ns.*, v.pvec, coalesce(nc.center,0.0) AS center, __rf_imp(v.pvec,(SELECT crit FROM __cv_crit)) AS imp,
-                      __rf_q(v.pvec,(SELECT crit FROM __cv_crit)) AS qpar
+     nstat AS (SELECT ns.*, v.pvec, coalesce(nc.center,0.0) AS center, __rf_imp(v.pvec,(SELECT crit FROM __rf_cv_crit)) AS imp,
+                      __rf_q(v.pvec,(SELECT crit FROM __rf_cv_crit)) AS qpar
                FROM ns JOIN nvec v ON v.g=ns.g AND v.tree=ns.tree AND v.node=ns.node
-               LEFT JOIN ncenter nc ON nc.g=ns.g AND nc.tree=ns.tree AND nc.node=ns.node),
-     sn AS (SELECT s.*, gr.mtry_g, gr.depth_g FROM nstat s JOIN __cv_groups gr ON gr.g = s.g
+               LEFT JOIN ncenter nc ON nc.g=ns.g AND nc.tree=ns.tree AND nc.node=ns.node
+               WHERE __rf_moment_ok(v.pvec,(SELECT crit FROM __rf_cv_crit),'rf_cv')),
+     sn AS (SELECT s.*, gr.mtry_g, gr.depth_g FROM nstat s JOIN __rf_cv_groups gr ON gr.g = s.g
             WHERE s.depth < gr.depth_g AND s.nrows >= 2 AND s.imp > 2.220446049250313e-16),
      nonconst AS (SELECT c.g, c.tree, c.node, f.col, f.kind
                   FROM cur c JOIN sn s ON s.g=c.g AND s.tree=c.tree AND s.node=c.node
-                  JOIN __cv_feat f ON f.rid = c.rid
+                  JOIN __rf_cv_feat f ON f.rid = c.rid
                   GROUP BY c.g, c.tree, c.node, f.col, f.kind
                   HAVING coalesce(min(f.v)<max(f.v),false) OR coalesce(min(f.lv)<max(f.lv),false)),
      mt AS (SELECT nc.g, nc.tree, nc.node, nc.col, nc.kind FROM nonconst nc
@@ -2136,7 +2149,7 @@ __cv_tr AS (
                      ORDER BY md5_number(seed||':cv:'||nc.g||':'||nc.tree||':'||nc.node||':'||nc.col)) <= s.mtry_g),
      cf AS (SELECT c.g, c.tree, c.node, c.rid, c.w, m.col, m.kind, f.v, f.lv
             FROM cur c JOIN mt m ON m.g=c.g AND m.tree=c.tree AND m.node=c.node
-            JOIN __cv_feat f ON f.rid=c.rid AND f.col=m.col),
+            JOIN __rf_cv_feat f ON f.rid=c.rid AND f.col=m.col),
      bcnt AS (SELECT g, tree, node, col, kind,
                      CASE WHEN kind='num' THEN __rf_bucket(v) ELSE lv END AS bucket,
                      any_value(v) AS bnum, count(*) AS bn
@@ -2149,7 +2162,7 @@ __cv_tr AS (
      bvec AS (SELECT b.g, b.tree, b.node, b.col, b.kind, b.bucket, b.bnum, b.bn,
                      list(coalesce(x.s,0.0) ORDER BY gg.slot) AS bv
               FROM (SELECT b2.g,b2.tree,b2.node,b2.col,b2.kind,b2.bucket,b2.bnum,b2.bn,s.slot
-                    FROM bcnt b2 CROSS JOIN __cv_slots s) gg
+                    FROM bcnt b2 CROSS JOIN __rf_cv_slots s) gg
               JOIN bcnt b ON b.g=gg.g AND b.tree=gg.tree AND b.node=gg.node AND b.col=gg.col AND b.bucket=gg.bucket
               LEFT JOIN bslot x ON x.g=gg.g AND x.tree=gg.tree AND x.node=gg.node AND x.col=gg.col
                    AND x.bucket=gg.bucket AND x.slot=gg.slot
@@ -2158,12 +2171,12 @@ __cv_tr AS (
                FROM bvec WHERE kind='num'
                UNION ALL
                SELECT b.g,b.tree,b.node,b.col,b.kind,b.bucket,b.bn,b.bv,o.slot AS ord,
-                      CASE WHEN (SELECT crit FROM __cv_crit)='mse' THEN b.bv[2]/b.bv[1]
+                      CASE WHEN (SELECT crit FROM __rf_cv_crit)='mse' THEN b.bv[2]/b.bv[1]
                            ELSE b.bv[o.slot]/list_sum(b.bv) END AS skey
-               FROM bvec b CROSS JOIN __cv_slots o
-               WHERE b.kind='cat' AND ((SELECT crit FROM __cv_crit)!='mse' OR o.slot=1)),
+               FROM bvec b CROSS JOIN __rf_cv_slots o
+               WHERE b.kind='cat' AND ((SELECT crit FROM __rf_cv_crit)!='mse' OR o.slot=1)),
      dense AS (SELECT c.g,c.tree,c.node,c.col,c.kind,c.ord,c.bucket,c.skey,c.bn,s.slot,c.bv[s.slot] AS s
-               FROM cands c CROSS JOIN __cv_slots s),
+               FROM cands c CROSS JOIN __rf_cv_slots s),
      cum AS (SELECT g,tree,node,col,kind,ord,bucket,skey,slot,
                     sum(s) OVER pw AS cs, sum(bn) OVER pw AS cn, lead(skey) OVER pw AS nextkey
              FROM dense
@@ -2173,15 +2186,15 @@ __cv_tr AS (
                      any_value(nextkey) AS nextkey, list(cs ORDER BY slot) AS lvec
               FROM cum GROUP BY g,tree,node,col,ord,bucket,skey),
      cvec AS (SELECT p.*, list_transform(p.lvec, lambda x,jj: s.pvec[jj]-x) AS rvec,
-                     __rf_wt(p.lvec,(SELECT crit FROM __cv_crit)) AS wl,
+                     __rf_wt(p.lvec,(SELECT crit FROM __rf_cv_crit)) AS wl,
                      s.depth AS depth, s.pvec, s.qpar, s.wn AS wn, wr.w_root
               FROM pref p JOIN sn s ON s.g=p.g AND s.tree=p.tree AND s.node=p.node
-              JOIN __cv_wroot wr ON wr.g=p.g AND wr.tree=p.tree
+              JOIN __rf_cv_wroot wr ON wr.g=p.g AND wr.tree=p.tree
               WHERE p.nextkey IS NOT NULL AND (p.kind != 'num' OR p.skey < p.nextkey)
                 AND p.nl >= min_samples_leaf
                 AND s.nrows - p.nl >= min_samples_leaf),
-     scored AS (SELECT c.*, __rf_q(c.lvec,(SELECT crit FROM __cv_crit))
-                            + __rf_q(c.rvec,(SELECT crit FROM __cv_crit)) - c.qpar AS gain
+     scored AS (SELECT c.*, __rf_q(c.lvec,(SELECT crit FROM __rf_cv_crit))
+                            + __rf_q(c.rvec,(SELECT crit FROM __rf_cv_crit)) - c.qpar AS gain
                 FROM cvec c),
      best AS (SELECT * FROM scored WHERE isfinite(gain) AND gain/w_root + 2.220446049250313e-16 >= 0.0
               QUALIFY row_number() OVER (PARTITION BY g,tree,node ORDER BY gain DESC, col, ord, skey, bucket)=1),
@@ -2204,7 +2217,7 @@ __cv_tr AS (
                         cats_left:=NULL::VARCHAR[], cats_right:=NULL::VARCHAR[], unseen_left:=NULL::BOOLEAN,
                         pred:=CASE WHEN family='regression' THEN s.pvec[2]/s.pvec[1]+s.center END,
                         cc:=CASE WHEN family='classification' THEN map_from_entries(list_transform(
-                              (SELECT classes FROM __cv_classlist), lambda c,jj: struct_pack(key:=c, value:=s.pvec[jj]))) END)
+                              (SELECT classes FROM __rf_cv_classlist), lambda c,jj: struct_pack(key:=c, value:=s.pvec[jj]))) END)
      FROM nstat s
      WHERE NOT EXISTS (SELECT 1 FROM best b WHERE b.g=s.g AND b.tree=s.tree AND b.node=s.node)
      UNION ALL
@@ -2213,79 +2226,79 @@ __cv_tr AS (
                             ELSE CASE WHEN list_contains(d.cats_left,f.lv) THEN 0 ELSE 1 END END,
             c.depth+1, c.rid, c.w, NULL
      FROM cur c JOIN bdef d ON d.g=c.g AND d.tree=c.tree AND d.node=c.node
-     JOIN __cv_feat f ON f.rid=c.rid AND f.col=d.col
+     JOIN __rf_cv_feat f ON f.rid=c.rid AND f.col=d.col
     )
 ),
-__cv_model AS MATERIALIZED (
+__rf_cv_model AS MATERIALIZED (
     SELECT g, tree, node, tag='leaf' AS is_leaf, m.col AS split_feature, m.kind AS split_kind,
            m.thr AS threshold, m.cats_left, m.cats_right, m.unseen_left, m.pred AS prediction, m.cc AS class_counts
-    FROM __cv_tr WHERE tag IN ('split','leaf')
+    FROM __rf_cv_tr WHERE tag IN ('split','leaf')
 ),
-__cv_int AS MATERIALIZED (SELECT * FROM __cv_model WHERE NOT is_leaf),
-__cv_leaf AS MATERIALIZED (SELECT g, tree, node, prediction, class_counts FROM __cv_model WHERE is_leaf),
+__rf_cv_int AS MATERIALIZED (SELECT * FROM __rf_cv_model WHERE NOT is_leaf),
+__rf_cv_leaf AS MATERIALIZED (SELECT g, tree, node, prediction, class_counts FROM __rf_cv_model WHERE is_leaf),
 -- ===== score held-out rows through their group's trees =====
-__cv_sc AS (
+__rf_cv_sc AS (
     SELECT gr.gidx, gr.g, t.tree, r.i AS rid, 1::BIGINT AS node
-    FROM __cv_rows r JOIN __cv_groups gr ON gr.held = r.fold CROSS JOIN __cv_trees t
+    FROM __rf_cv_rows r JOIN __rf_cv_groups gr ON gr.held = r.fold CROSS JOIN __rf_cv_trees t
   UNION ALL
     SELECT s.gidx, s.g, s.tree, s.rid,
            s.node*2 + CASE WHEN i.split_kind='num' THEN CASE WHEN f.v<=i.threshold THEN 0 ELSE 1 END
                            ELSE CASE WHEN list_contains(i.cats_left,f.lv) THEN 0
                                      WHEN list_contains(i.cats_right,f.lv) THEN 1
                                      WHEN i.unseen_left THEN 0 ELSE 1 END END
-    FROM __cv_sc s JOIN __cv_int i ON i.g=s.g AND i.tree=s.tree AND i.node=s.node
-    JOIN __cv_feat f ON f.rid=s.rid AND f.col=i.split_feature
+    FROM __rf_cv_sc s JOIN __rf_cv_int i ON i.g=s.g AND i.tree=s.tree AND i.node=s.node
+    JOIN __rf_cv_feat f ON f.rid=s.rid AND f.col=i.split_feature
 ),
-__cv_landed AS (
+__rf_cv_landed AS (
     SELECT s.gidx, s.rid, s.tree, l.prediction, l.class_counts
-    FROM __cv_sc s JOIN __cv_leaf l ON l.g=s.g AND l.tree=s.tree AND l.node=s.node
+    FROM __rf_cv_sc s JOIN __rf_cv_leaf l ON l.g=s.g AND l.tree=s.tree AND l.node=s.node
 ),
 -- forest prediction per (grid value, row)
-__cv_regpred AS (
-    SELECT gidx, rid, avg(prediction) AS yhat FROM __cv_landed GROUP BY gidx, rid
+__rf_cv_regpred AS (
+    SELECT gidx, rid, avg(prediction) AS yhat FROM __rf_cv_landed GROUP BY gidx, rid
 ),
-__cv_clsprob AS (
+__rf_cv_clsprob AS (
     SELECT gidx, rid, cls, avg(cnt / wsum) AS p
     FROM (SELECT gidx, rid,
                  unnest(map_keys(class_counts))   AS cls,
                  unnest(map_values(class_counts)) AS cnt,
                  list_sum(map_values(class_counts)) AS wsum
-          FROM __cv_landed)
+          FROM __rf_cv_landed)
     GROUP BY gidx, rid, cls
 ),
-__cv_clspred AS (
-    SELECT gidx, rid, (list(cls ORDER BY p DESC, cls))[1] AS pred FROM __cv_clsprob GROUP BY gidx, rid
+__rf_cv_clspred AS (
+    SELECT gidx, rid, (list(cls ORDER BY p DESC, cls))[1] AS pred FROM __rf_cv_clsprob GROUP BY gidx, rid
 ),
-__cv_err AS (
+__rf_cv_err AS (
     SELECT p.gidx, avg((p.pred != y.cls)::INT) AS err
-    FROM __cv_clspred p JOIN __cv_ysval y ON y.rid = p.rid WHERE family='classification'
+    FROM __rf_cv_clspred p JOIN __rf_cv_ysval y ON y.rid = p.rid WHERE family='classification'
     GROUP BY p.gidx
     UNION ALL
     SELECT p.gidx, avg((y.yv - p.yhat)*(y.yv - p.yhat)) AS err
-    FROM __cv_regpred p JOIN __cv_ysval y ON y.rid = p.rid WHERE family='regression'
+    FROM __rf_cv_regpred p JOIN __rf_cv_ysval y ON y.rid = p.rid WHERE family='regression'
     GROUP BY p.gidx
 ),
--- Family / outcome guards that DO NOT depend on any family-gated CTE. __cv_chk
--- (k / grid / n_trees / complete-rows) is forced only via __cv_rows, which feeds
--- the recursion -> __cv_err; but __cv_err's two branches are each gated on
+-- Family / outcome guards that DO NOT depend on any family-gated CTE. __rf_cv_chk
+-- (k / grid / n_trees / complete-rows) is forced only via __rf_cv_rows, which feeds
+-- the recursion -> __rf_cv_err; but __rf_cv_err's two branches are each gated on
 -- family = one of the two valid literals, so an ILLEGAL family (or a nonexistent
--- outcome, which makes __cv_ysval and hence __cv_err empty) constant-folds the
--- whole result to empty, the optimizer prunes __cv_rows, and __cv_chk's error()
+-- outcome, which makes __rf_cv_ysval and hence __rf_cv_err empty) constant-folds the
+-- whole result to empty, the optimizer prunes __rf_cv_rows, and __rf_cv_chk's error()
 -- never runs -- the query silently returns zero rows. These two checks live in a
--- single-row guard CTE that DRIVES the final SELECT (LEFT JOIN __cv_err), so it
--- is always evaluated regardless of whether __cv_err is empty.
-__cv_guard AS (
+-- single-row guard CTE that DRIVES the final SELECT (LEFT JOIN __rf_cv_err), so it
+-- is always evaluated regardless of whether __rf_cv_err is empty.
+__rf_cv_guard AS (
     SELECT CASE
              WHEN family IS NULL OR family NOT IN ('classification', 'regression')
                THEN error('rf_cv: family must be ''classification'' or ''regression'', got ''' || coalesce(family, 'NULL') || '''')
-             WHEN (SELECT count(*) FROM __cv_types WHERE colname = outcome) = 0
+             WHEN (SELECT count(*) FROM __rf_cv_types WHERE colname = outcome) = 0
                THEN error('rf_cv: outcome column "' || outcome || '" not found in "' || tbl || '"')
              ELSE true
            END AS ok
 )
 SELECT grid[e.gidx] AS param, e.err AS cv_error
-FROM __cv_guard g
-LEFT JOIN __cv_err e ON true
+FROM __rf_cv_guard g
+LEFT JOIN __rf_cv_err e ON true
 WHERE g.ok AND e.gidx IS NOT NULL
 ORDER BY e.gidx;
 

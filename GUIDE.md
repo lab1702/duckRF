@@ -80,6 +80,9 @@ fitting only — `rf_*_predict` and `rf_*_evaluate` don't take them. Supplied
 weights must be finite numeric values. Zero-weight observations do not count
 toward node sample limits. If a sampled tree has zero total weight, fitting
 errors; change the seed, increase `sample_frac`, or use positive weights.
+Regression fitting and CV also reject overflowing intermediate moments; rescale
+the outcomes or sample weights when their combined magnitude exceeds DOUBLE
+arithmetic, even if the individual input values are finite.
 
 ```sql
 CREATE TABLE m AS SELECT * FROM rf_class_fit('surveys', 'label', weights_col := 'sampling_weight');

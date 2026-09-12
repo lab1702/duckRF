@@ -2360,3 +2360,42 @@ class TestWeightScaleAndFiniteResponses:
         assert 'replace_sample := NULL' in sql
         with pytest.raises(DuckDBError, match='replace_sample'):
             con.execute(sql).fetchall()
+
+
+class TestNamespacesAndOverflow:
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    @pytest.mark.parametrize('table', ['__cv_types', '__cv_rows', '__cv_y'])
+    def test_cv_accepts_nonreserved_internal_looking_names(self, con, macro, table):
+        con.execute(f'CREATE OR REPLACE TABLE {table} AS SELECT i x, i y FROM range(8) t(i)')
+        con.execute(f'CREATE OR REPLACE TABLE plain_cv AS SELECT * FROM {table}')
+        query = f"SELECT * FROM {macro}('{{}}','y','regression',[1],k:=2,n_trees:=1)"
+        pd.testing.assert_frame_equal(df_run(con, query.format(table)), df_run(con, query.format('plain_cv')))
+
+    @pytest.mark.parametrize('parameter', ['seed', 'min_samples_split', 'min_samples_leaf',
+                                          'sample_frac', 'min_impurity_decrease', 'splitter'])
+    def test_batch_preserves_required_nulls_for_fit_guard(self, con, parameter):
+        con.execute('CREATE OR REPLACE TABLE bn AS SELECT i x, i y FROM range(3) t(i)')
+        sql = con.execute(f"SELECT rf_batched_fit_sql('bn','y','regression',n_trees:=1,{parameter}:=NULL)").fetchone()[0]
+        assert f'{parameter} := NULL' in sql
+        with pytest.raises(DuckDBError, match=parameter):
+            con.execute(sql).fetchall()
+
+    @pytest.mark.parametrize('parameter', ['n_trees', 'batch_size'])
+    def test_batch_null_range_parameters_error(self, con, parameter):
+        with pytest.raises(DuckDBError, match=parameter):
+            con.execute(f"SELECT rf_batched_fit_sql('t','y','regression',{parameter}:=NULL)").fetchall()
+
+    @pytest.mark.parametrize('weighted', [False, True])
+    def test_unrepresentable_regression_moments_error(self, con, weighted):
+        if weighted:
+            con.execute('CREATE OR REPLACE TABLE ov AS SELECT i x, (i//2)*1e60 y, 1e200 w FROM range(4) t(i)')
+        else:
+            con.execute('CREATE OR REPLACE TABLE ov AS SELECT * FROM (VALUES (0,-1e308,1.0),(1,1e308,1.0)) t(x,y,w)')
+        with pytest.raises(DuckDBError, match='regression moment overflow'):
+            df_run(con, "SELECT * FROM rf_reg_fit('ov','y',weights_col:='w',n_trees:=1,replace_sample:=false)")
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    def test_cv_unrepresentable_moments_error(self, con, macro):
+        con.execute('CREATE OR REPLACE TABLE oc AS SELECT i x, CASE WHEN i%4<2 THEN -1e308 ELSE 1e308 END y FROM range(20) t(i)')
+        with pytest.raises(DuckDBError, match='regression moment overflow'):
+            df_run(con, f"SELECT * FROM {macro}('oc','y','regression',[1],k:=2,n_trees:=2)")

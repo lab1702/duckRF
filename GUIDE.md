@@ -102,7 +102,7 @@ Forest. Everything about the forest is the same — the same bootstrap, the same
 pruning — *except how each node's split is chosen*:
 
 - **Random Forest** (`splitter := 'best'`, the default) searches every candidate
-  feature for the single **best** split (the exact CART optimum).
+  feature for the best candidate split (see categorical limitations below).
 - **Extra Trees** (`splitter := 'random'`) draws **one random split per
   candidate feature** and keeps the feature whose random split has the best gain.
   For a numeric feature it draws a single threshold uniformly in the feature's
@@ -536,10 +536,16 @@ importance across dummy columns. The native split keeps the categorical as one
 feature with its full expressive power.
 
 **How optimal it is — honestly.** For **regression and binary classification**
-the scan is the **exact optimum** over all `2^(L−1)−1` non-trivial subsets: sort
+without binding minimum-leaf constraints, the scan finds the **exact optimum**
+over all `2^(L−1)−1` non-trivial subsets: sort
 the levels by the in-level mean of `y` (regression) or `P(y = positive | level)`
 (binary), and the best prefix is provably the best subset (the Fisher/Breiman
-result). For **K > 2 classes** it evaluates the `K` orderings by `P(y = k |
+result). With `min_samples_leaf > 1`, a valid non-prefix subset can be missed,
+even when every prefix violates the size constraint; the node then remains a
+leaf. For example, levels with counts 2/10/2 ordered by means 0/5/20 have no
+valid prefix at `min_samples_leaf := 4`, although combining the two outer levels
+would produce a valid split. This prefix-search limitation also applies to CV.
+For **K > 2 classes** it evaluates the `K` orderings by `P(y = k |
 level)` and keeps the best — the standard Breiman/Ripley heuristic (LightGBM does
 the same). That heuristic is **not guaranteed optimal** for K > 2, and it does
 not enumerate every one-vs-rest singleton split. It is fast, standard, and works

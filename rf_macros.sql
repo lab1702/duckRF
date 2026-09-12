@@ -127,7 +127,9 @@
 --   * VARCHAR / ENUM features are true categoricals: the split is a SUBSET of
 --     the levels (cats_left), found by the Fisher/Breiman prefix scan, not a
 --     one-hot threshold. For regression and binary classification the prefix
---     scan is the exact optimum over all 2^(L-1)-1 subsets; for K > 2 classes
+--     scan is optimal over all subsets without binding minimum-leaf constraints.
+--     With min_samples_leaf constraints, valid non-prefix subsets may be missed.
+--     For K > 2 classes
 --     it evaluates the K orderings by P(y = k | level) and keeps the best --
 --     the standard Breiman/Ripley heuristic (LightGBM does the same). It is
 --     NOT guaranteed optimal for K > 2, and it does not enumerate every
@@ -264,6 +266,10 @@ CREATE OR REPLACE MACRO __rf_q(vec, crit) AS (
       ELSE vec[2] * vec[2] / vec[1]
     END
 );
+
+CREATE OR REPLACE MACRO __rf_number(sval, typename) AS
+    CASE WHEN typename = 'BOOLEAN' THEN CASE sval WHEN 'true' THEN 1.0 WHEN 'false' THEN 0.0 END
+         ELSE TRY_CAST(sval AS DOUBLE) END;
 
 CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
     CASE crit
@@ -488,20 +494,6 @@ __rf_rows AS MATERIALIZED (
     WHERE ck.ok
 ),
 __rf_n AS (SELECT count(*)::BIGINT AS n FROM __rf_rows),
--- Global weighted-free mean of the regression outcome. The outcome is fit on
--- y - ybar throughout and ybar is added back into the leaf prediction: gain and
--- impurity are provably invariant to shifting y, but the naive
--- sum(w*y^2) - sum(w*y)^2/W form loses catastrophic precision when
--- |mean(y)| >> sd(y) (prices, revenue, counts, years) -- enough to pick a
--- genuinely WORSE split than the true argmax. One extra pass buys exactness.
-__rf_ybar AS (
-    SELECT CASE WHEN family = 'regression' THEN coalesce(avg(y.yv), 0.0) ELSE 0.0 END AS ybar
-    FROM __rf_ysval y SEMI JOIN __rf_rows r ON r.rid = y.rid
-),
-__rf_y AS MATERIALIZED (
-    SELECT r.i AS rid, y.sval AS cls, y.yv - (SELECT ybar FROM __rf_ybar) AS yv
-    FROM __rf_ysval y JOIN __rf_rows r ON r.rid = y.rid
-),
 -- Per-row sample weight: the weights column (1.0 when absent) times the
 -- 'balanced' class weight n / (K * n_k) (sklearn's exact formula; the class
 -- counts are unweighted, as sklearn's compute_class_weight uses bincount(y)).
@@ -510,6 +502,22 @@ __rf_wcol AS (
                                ELSE TRY_CAST(s.sval AS DOUBLE) END AS w
     FROM __rf_rows r
     LEFT JOIN __rf_slong s ON s.rid = r.rid AND s.col = coalesce(weights_col, '')
+),
+-- Mean of the positive-weight regression outcomes. The outcome is fit on
+-- y - ybar throughout and ybar is added back into the leaf prediction: gain and
+-- impurity are provably invariant to shifting y, but the naive
+-- sum(w*y^2) - sum(w*y)^2/W form loses catastrophic precision when
+-- |mean(y)| >> sd(y) (prices, revenue, counts, years) -- enough to pick a
+-- genuinely WORSE split than the true argmax. One extra pass buys exactness.
+__rf_ybar AS (
+    SELECT CASE WHEN family = 'regression' THEN coalesce(avg(y.yv), 0.0) ELSE 0.0 END AS ybar
+    FROM __rf_ysval y JOIN __rf_rows r ON r.rid = y.rid
+    JOIN __rf_wcol w ON w.rid = r.i
+    WHERE w.w > 0
+),
+__rf_y AS MATERIALIZED (
+    SELECT r.i AS rid, y.sval AS cls, y.yv - (SELECT ybar FROM __rf_ybar) AS yv
+    FROM __rf_ysval y JOIN __rf_rows r ON r.rid = y.rid
 ),
 __rf_cw AS (
     SELECT y.cls,
@@ -751,8 +759,8 @@ __rf_tr AS (
      -- a candidate split (left = prefix, right = parent - prefix).
      --   numeric     -> ord 0, key = the value itself (exact CART)
      --   categorical -> regression: key = mean(y) in the level; the prefix split
-     --                  is then provably the optimum over all subsets
-     --                  (Fisher/Breiman).
+     --                  is optimal over all subsets without binding leaf-size
+     --                  constraints (Fisher/Breiman).
      --                  classification: one ordering per class k, key =
      --                  P(y = k | level); exact for K = 2, a heuristic above.
      -- Sort-key ties break on the bucket name so the scan is deterministic.
@@ -1609,6 +1617,12 @@ ORDER BY rid, tree;
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO __rf_reg_eval(model, tbl, outcome, caller, na_action, n_trees, oob) AS TABLE
 WITH
+__rf_types AS MATERIALIZED (
+    SELECT colname, typename
+    FROM (SELECT * FROM (SELECT 1 AS __rf_one)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+         UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
+),
 __rf_pred AS (
     SELECT rid, avg(prediction) AS yhat
     FROM __rf_walk(model, tbl, caller, 'regression', na_action, n_trees, oob)
@@ -1620,7 +1634,7 @@ __rf_pred AS (
 -- columns", short-circuiting the clean "no rows ..." guard below). A missing
 -- column just yields no rows here, so __rf_rows is empty and __rf_ck fires.
 __rf_truth AS (
-    SELECT rid, TRY_CAST(sval AS DOUBLE) AS y
+    SELECT rid, __rf_number(sval, (SELECT typename FROM __rf_types WHERE colname = outcome)) AS y
     FROM (SELECT __rf_rid__ AS rid, name AS col, value AS sval
           FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
                          FROM query_table(tbl))
@@ -1925,17 +1939,38 @@ __cv_complete AS MATERIALIZED (
 ),
 __cv_chk AS (
     SELECT CASE
-             WHEN family NOT IN ('classification', 'regression')
-               THEN error('rf_cv: family must be ''classification'' or ''regression'', got ''' || family || '''')
-             WHEN k < 2 THEN error('rf_cv: k must be >= 2, got ' || k)
-             WHEN len(grid) < 1 THEN error('rf_cv: grid must be non-empty')
+             WHEN family IS NULL OR family NOT IN ('classification', 'regression')
+               THEN error('rf_cv: family must be ''classification'' or ''regression'', got ''' || coalesce(family, 'NULL') || '''')
+             WHEN (SELECT count(*) FROM __cv_featcols WHERE kind IS NULL) > 0
+               THEN error('rf_cv: unsupported feature type: ' ||
+                          (SELECT string_agg(colname || ' (' || typename || ')', ', ')
+                           FROM __cv_types WHERE colname != outcome AND kind IS NULL))
+             WHEN family = 'regression' AND (SELECT kind FROM __cv_types WHERE colname = outcome) != 'num'
+               THEN error('rf_cv: regression outcome must be numeric')
+             WHEN k IS NULL OR k < 2 THEN error('rf_cv: k must be >= 2')
+             WHEN k > (SELECT count(*) FROM __cv_complete)
+               THEN error('rf_cv: k must not exceed the number of complete rows')
+             WHEN grid IS NULL OR len(grid) < 1 THEN error('rf_cv: grid must be non-empty')
+             WHEN len(list_filter(grid, lambda x: x IS NULL)) > 0
+               THEN error('rf_cv: grid values must not be NULL')
              WHEN sweep = 'mtry' AND list_aggregate(grid, 'min') < 1
                THEN error('rf_cv: every mtry must be >= 1')
              WHEN sweep = 'mtry' AND list_aggregate(grid, 'max') > (SELECT d FROM __cv_d)
                THEN error('rf_cv: mtry must not exceed the number of features (' || (SELECT d FROM __cv_d) || ')')
              WHEN sweep = 'depth' AND list_aggregate(grid, 'min') < 1
                THEN error('rf_cv: every max_depth must be >= 1')
-             WHEN n_trees < 1 THEN error('rf_cv: n_trees must be >= 1')
+             WHEN sweep = 'depth' AND list_aggregate(grid, 'max') > 60
+               THEN error('rf_cv: every max_depth must be <= 60')
+             WHEN max_depth_fixed IS NOT NULL AND (max_depth_fixed < 1 OR max_depth_fixed > 60)
+               THEN error('rf_cv: max_depth must be between 1 and 60, or NULL')
+             WHEN mtry_fixed IS NOT NULL AND (mtry_fixed < 1 OR mtry_fixed > (SELECT d FROM __cv_d))
+               THEN error('rf_cv: mtry must be between 1 and the number of features')
+             WHEN sample_frac IS NULL OR NOT isfinite(sample_frac) OR sample_frac <= 0 OR sample_frac > 1
+               THEN error('rf_cv: sample_frac must be in (0, 1]')
+             WHEN min_samples_leaf IS NULL OR min_samples_leaf < 1
+               THEN error('rf_cv: min_samples_leaf must be >= 1')
+             WHEN seed IS NULL THEN error('rf_cv: seed must not be NULL')
+             WHEN n_trees IS NULL OR n_trees < 1 THEN error('rf_cv: n_trees must be >= 1')
              WHEN (SELECT count(*) FROM __cv_complete) = 0 THEN error('rf_cv: no complete rows')
              ELSE true END AS ok
 ),
@@ -1946,7 +1981,7 @@ __cv_rows AS MATERIALIZED (
 ),
 __cv_ysval AS MATERIALIZED (
     SELECT r.i AS rid, s.sval AS cls,
-           TRY_CAST(s.sval AS DOUBLE) AS yv
+           __rf_number(s.sval, (SELECT typename FROM __cv_types WHERE colname = outcome)) AS yv
     FROM __cv_slong s JOIN __cv_rows r ON r.rid = s.rid WHERE s.col = outcome
 ),
 __cv_ybar AS (SELECT CASE WHEN family = 'regression' THEN avg(yv) ELSE 0.0 END AS ybar FROM __cv_ysval),
@@ -2183,8 +2218,8 @@ __cv_err AS (
 -- is always evaluated regardless of whether __cv_err is empty.
 __cv_guard AS (
     SELECT CASE
-             WHEN family NOT IN ('classification', 'regression')
-               THEN error('rf_cv: family must be ''classification'' or ''regression'', got ''' || family || '''')
+             WHEN family IS NULL OR family NOT IN ('classification', 'regression')
+               THEN error('rf_cv: family must be ''classification'' or ''regression'', got ''' || coalesce(family, 'NULL') || '''')
              WHEN (SELECT count(*) FROM __cv_types WHERE colname = outcome) = 0
                THEN error('rf_cv: outcome column "' || outcome || '" not found in "' || tbl || '"')
              ELSE true
@@ -2330,7 +2365,7 @@ __rf_full AS (
 -- comparable to the model's classes, which rf_class_fit stored as VARCHAR), yv =
 -- the numeric value for regression. A missing outcome yields no rows here.
 __rf_truth AS (
-    SELECT rid, sval AS ys, TRY_CAST(sval AS DOUBLE) AS yv
+    SELECT rid, sval AS ys, __rf_number(sval, (SELECT typename FROM __rf_types WHERE colname = outcome)) AS yv
     FROM __rf_slong WHERE col = outcome
 ),
 -- The scored set: complete feature rows with a valid outcome, numbered i = 1..n
@@ -2601,7 +2636,7 @@ __rf_refwalk AS MATERIALIZED (
     CROSS JOIN __rf_qchk ck WHERE ck.ok
 ),
 __rf_refy AS MATERIALIZED (
-    SELECT rid, TRY_CAST(sval AS DOUBLE) AS y
+    SELECT rid, __rf_number(sval, (SELECT typename FROM __rf_reftypes WHERE colname = outcome)) AS y
     FROM (SELECT __rf_rid__ AS rid, name AS col, value AS sval
           FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
                          FROM query_table(tbl))

@@ -20,7 +20,7 @@ realized objective is *no worse* than sklearn's.
 Also covered: soft-voting forest accuracy/R² within tolerance of sklearn's
 `RandomForest` on a holdout; every `*_evaluate` metric vs the sklearn metric
 function (accuracy / log-loss / brier / AUC / RMSE / MAE / R²); categorical
-subset splits vs a brute-force optimum (exact for regression and binary
+subset splits vs a brute-force optimum (unconstrained exact optimum for regression and binary
 classification, "at least as good as the best singleton" for the K>2 heuristic),
 including numeric-looking levels that stay categorical, ENUM columns, and the
 headline categorical-outcome / categorical-features use case; out-of-bag

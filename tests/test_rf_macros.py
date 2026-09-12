@@ -2114,3 +2114,61 @@ class TestEdgeCaseRegressions:
         got = con.execute(f"SELECT {column} FROM rf_{family}_predict('sm','sn',na_action:='skip_tree')").fetchone()[0]
         assert got == (0.5 if family == 'reg' else '0')
         assert con.execute(f"SELECT {column} FROM rf_{family}_predict('sm','sn')").fetchone()[0] is None
+
+
+class TestOutcomeAndCVContracts:
+    @pytest.mark.parametrize('diagnostic', ['evaluate', 'oob', 'quantile', 'importance', 'cv', 'cv_depth'])
+    def test_boolean_regression_matches_integer_outcome(self, con, diagnostic):
+        con.execute('CREATE OR REPLACE TABLE bt AS SELECT i x, i>=10 y FROM range(20) t(i)')
+        con.execute('CREATE OR REPLACE TABLE it AS SELECT x, y::INTEGER y FROM bt')
+        for table, model in [('bt', 'bm'), ('it', 'im')]:
+            con.execute(f"CREATE OR REPLACE TABLE {model} AS SELECT * FROM rf_reg_fit('{table}','y',n_trees:=10,max_depth:=2)")
+        queries = {
+            'evaluate': "SELECT * FROM rf_reg_evaluate('{m}','{t}','y')",
+            'oob': "SELECT * FROM rf_reg_oob('{m}','{t}','y')",
+            'quantile': "SELECT quantile_pred FROM rf_reg_quantile('{m}','{t}','y',[0.1,0.5,0.9])",
+            'importance': "SELECT * FROM rf_permutation_importance('{m}','{t}','y',n_repeats:=1)",
+            'cv': "SELECT * FROM rf_cv('{t}','y','regression',[1],k:=2,n_trees:=2)",
+            'cv_depth': "SELECT * FROM rf_cv_depth('{t}','y','regression',[2],k:=2,n_trees:=2)",
+        }
+        boolean = df_run(con, queries[diagnostic].format(m='bm', t='bt'))
+        integer = df_run(con, queries[diagnostic].format(m='im', t='it'))
+        assert len(boolean) > 0
+        pd.testing.assert_frame_equal(boolean, integer, check_exact=False, atol=1e-12, rtol=1e-12)
+
+    @pytest.mark.parametrize('min_split, expected', [(2, [0.0, 1.0]), (3, [0.5, 0.5])])
+    def test_zero_weight_extreme_outcome_does_not_change_fit(self, con, min_split, expected):
+        con.execute('''CREATE OR REPLACE TABLE wt AS SELECT * FROM
+            (VALUES (0,0.0,1),(1,1.0,1),(2,1e20,0)) t(x,y,w)''')
+        con.execute(f"""CREATE OR REPLACE TABLE wm AS SELECT * FROM rf_reg_fit('wt','y',
+            weights_col:='w',n_trees:=1,replace_sample:=false,min_samples_split:={min_split})""")
+        con.execute('CREATE OR REPLACE TABLE wq AS SELECT x FROM wt WHERE w>0')
+        got = df_run(con, "SELECT prediction FROM rf_reg_predict('wm','wq')").prediction
+        np.testing.assert_allclose(got, expected, atol=1e-12)
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    @pytest.mark.parametrize('feature', ["DATE '2020-01-01'+i::INTEGER", '[i]', "{'value': i}"])
+    def test_cv_rejects_unsupported_feature_type(self, con, macro, feature):
+        con.execute(f'CREATE OR REPLACE TABLE badcv AS SELECT {feature} x, i y FROM range(20) t(i)')
+        with pytest.raises(DuckDBError, match='unsupported feature type'):
+            df_run(con, f"SELECT * FROM {macro}('badcv','y','regression',[1],k:=2,n_trees:=2)")
+
+    @pytest.mark.parametrize('macro, grid, args, message', [
+        ('rf_cv', '[1]', 'sample_frac:=0', 'sample_frac'),
+        ('rf_cv', '[1]', 'sample_frac:=2', 'sample_frac'),
+        ('rf_cv', '[1]', 'sample_frac:=NULL', 'sample_frac'),
+        ('rf_cv', '[1]', 'min_samples_leaf:=0', 'min_samples_leaf'),
+        ('rf_cv', '[1]', 'seed:=NULL', 'seed'),
+        ('rf_cv', '[1]', 'k:=20', 'complete rows'),
+        ('rf_cv', '[1]', 'k:=NULL', 'k must'),
+        ('rf_cv', '[1]', 'max_depth:=0', 'max_depth'),
+        ('rf_cv', '[1]', 'max_depth:=61', 'max_depth'),
+        ('rf_cv', '[NULL]', 'k:=2', 'grid values'),
+        ('rf_cv', 'NULL::INTEGER[]', 'k:=2', 'grid must'),
+        ('rf_cv_depth', '[61]', 'k:=2', 'max_depth'),
+        ('rf_cv_depth', '[1]', 'mtry:=0', 'mtry'),
+    ])
+    def test_cv_parameter_guards(self, con, macro, grid, args, message):
+        con.execute('CREATE OR REPLACE TABLE gc AS SELECT i x, i*i y FROM range(10) t(i)')
+        with pytest.raises(DuckDBError, match=message):
+            df_run(con, f"SELECT * FROM {macro}('gc','y','regression',{grid},n_trees:=1,{args})")

@@ -429,6 +429,10 @@ SELECT * FROM rf_class_oob('cmodel', 'penguins_filtered', 'species');
 -- training table (row identity is the row ordinal)
 ```
 
+The fingerprint uses structured field serialization. Forests saved with the
+earlier delimiter-based fingerprint must be refitted for OOB checks with this
+version; ordinary prediction does not use the fingerprint.
+
 If you need OOB, keep the training table around unchanged (or re-`CREATE` it the
 same way). For scoring *new* data, use `rf_*_predict` / `rf_*_evaluate` instead.
 

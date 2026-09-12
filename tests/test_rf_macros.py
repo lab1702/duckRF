@@ -2172,3 +2172,41 @@ class TestOutcomeAndCVContracts:
         con.execute('CREATE OR REPLACE TABLE gc AS SELECT i x, i*i y FROM range(10) t(i)')
         with pytest.raises(DuckDBError, match=message):
             df_run(con, f"SELECT * FROM {macro}('gc','y','regression',{grid},n_trees:=1,{args})")
+
+
+class TestTrainingBoundaryContracts:
+    @pytest.mark.parametrize('macro', ['rf_reg_fit', 'rf_class_fit'])
+    @pytest.mark.parametrize('parameter', ['n_trees', 'replace_sample', 'min_samples_split',
+                                          'min_samples_leaf', 'min_impurity_decrease', 'sample_frac', 'criterion'])
+    def test_null_required_fit_parameters_error(self, con, macro, parameter):
+        con.execute('CREATE OR REPLACE TABLE np AS SELECT i x, i%2 y FROM range(10) t(i)')
+        with pytest.raises(DuckDBError, match=parameter):
+            df_run(con, f"SELECT * FROM {macro}('np','y',{parameter}:=NULL)")
+
+    def test_oob_fingerprint_encodes_delimiters(self, con):
+        con.execute("""CREATE OR REPLACE TABLE ht AS SELECT
+            CASE WHEN i%2=0 THEN 'a|b' ELSE 'd|e' END a, 'c' b, i%2 y FROM range(20) t(i)""")
+        con.execute("""CREATE OR REPLACE TABLE hq AS SELECT split_part(a,'|',1) a,
+            split_part(a,'|',2)||'|'||b b,y FROM ht""")
+        con.execute("CREATE OR REPLACE TABLE hm AS SELECT * FROM rf_class_fit('ht','y',n_trees:=10,mtry:=2)")
+        assert df_run(con, "SELECT * FROM rf_class_oob('hm','ht','y')").accuracy.iloc[0] == 1.0
+        with pytest.raises(DuckDBError, match='fingerprint mismatch'):
+            df_run(con, "SELECT * FROM rf_class_oob('hm','hq','y')")
+
+    @pytest.mark.parametrize('bounds', [(1.0, np.nextafter(1.0, np.inf)), (-1e308, 1e308)])
+    @pytest.mark.parametrize('macro', ['rf_class_fit', 'rf_reg_fit'])
+    def test_random_split_separates_numeric_endpoints(self, con, bounds, macro):
+        _load(con, 'ep', pd.DataFrame({'x': bounds, 'y': [0, 1]}))
+        model = df_run(con, f"SELECT * FROM {macro}('ep','y',n_trees:=1,replace_sample:=false,splitter:='random',seed:=3)")
+        assert len(model) == 3
+        threshold = model.loc[~model.is_leaf, 'threshold'].iloc[0]
+        assert np.isfinite(threshold) and bounds[0] <= threshold < bounds[1]
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    @pytest.mark.parametrize('column', ['x', 'y'])
+    @pytest.mark.parametrize('value', ['NaN', 'Inf', '-Inf'])
+    def test_cv_nonfinite_cells_error(self, con, macro, column, value):
+        con.execute('CREATE OR REPLACE TABLE nf AS SELECT i::DOUBLE x, i::DOUBLE y FROM range(10) t(i)')
+        con.execute(f"UPDATE nf SET {column}='{value}'::DOUBLE WHERE x=0")
+        with pytest.raises(DuckDBError, match='NaN or Inf'):
+            df_run(con, f"SELECT * FROM {macro}('nf','y','regression',[1],k:=2,n_trees:=2)")

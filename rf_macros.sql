@@ -445,21 +445,23 @@ __rf_chk AS (
                THEN error(caller || ': outcome column "' || outcome || '" has a single class ("'
                           || (SELECT any_value(cls) FROM __rf_classes)
                           || '"); classification needs at least two')
-             WHEN n_trees < 1
-               THEN error(caller || ': n_trees must be >= 1, got ' || n_trees)
+             WHEN n_trees IS NULL OR n_trees < 1
+               THEN error(caller || ': n_trees must be >= 1, got ' || coalesce(n_trees::VARCHAR, 'NULL'))
              WHEN mtry IS NOT NULL AND (mtry < 1 OR mtry > (SELECT d FROM __rf_d))
                THEN error(caller || ': mtry must be between 1 and the number of features ('
                           || (SELECT d FROM __rf_d) || '), got ' || mtry)
              WHEN max_depth IS NOT NULL AND (max_depth < 1 OR max_depth > 60)
                THEN error(caller || ': max_depth must be between 1 and 60, or NULL to grow to purity; got ' || max_depth)
-             WHEN min_samples_split < 2
-               THEN error(caller || ': min_samples_split must be >= 2, got ' || min_samples_split)
-             WHEN min_samples_leaf < 1
-               THEN error(caller || ': min_samples_leaf must be >= 1, got ' || min_samples_leaf)
-             WHEN min_impurity_decrease < 0
-               THEN error(caller || ': min_impurity_decrease must be >= 0, got ' || min_impurity_decrease)
-             WHEN sample_frac <= 0 OR sample_frac > 1
-               THEN error(caller || ': sample_frac must be in (0, 1], got ' || sample_frac)
+             WHEN min_samples_split IS NULL OR min_samples_split < 2
+               THEN error(caller || ': min_samples_split must be >= 2, got ' || coalesce(min_samples_split::VARCHAR, 'NULL'))
+             WHEN min_samples_leaf IS NULL OR min_samples_leaf < 1
+               THEN error(caller || ': min_samples_leaf must be >= 1, got ' || coalesce(min_samples_leaf::VARCHAR, 'NULL'))
+             WHEN min_impurity_decrease IS NULL OR NOT isfinite(min_impurity_decrease) OR min_impurity_decrease < 0
+               THEN error(caller || ': min_impurity_decrease must be >= 0, got ' || coalesce(min_impurity_decrease::VARCHAR, 'NULL'))
+             WHEN sample_frac IS NULL OR NOT isfinite(sample_frac) OR sample_frac <= 0 OR sample_frac > 1
+               THEN error(caller || ': sample_frac must be in (0, 1], got ' || coalesce(sample_frac::VARCHAR, 'NULL'))
+             WHEN replace_sample IS NULL THEN error(caller || ': replace_sample must not be NULL')
+             WHEN criterion IS NULL THEN error(caller || ': criterion must not be NULL')
              WHEN family = 'classification' AND criterion NOT IN ('gini', 'entropy')
                THEN error(caller || ': criterion must be ''gini'' or ''entropy'', got ''' || criterion || '''')
              WHEN family = 'regression' AND criterion != 'mse'
@@ -638,7 +640,7 @@ __rf_wroot AS MATERIALIZED (
 -- it can say so instead of returning plausible garbage.
 __rf_hash AS (
     SELECT coalesce(sum((md5_number(rowkey) % 4611686018427387847::UHUGEINT)::BIGINT), 0)::HUGEINT AS h
-    FROM (SELECT r.i || '|' || string_agg(s.sval, '|' ORDER BY s.col) AS rowkey
+    FROM (SELECT r.i || '|' || to_json(list(struct_pack(col := s.col, val := s.sval) ORDER BY s.col)) AS rowkey
           FROM __rf_slong s JOIN __rf_rows r ON r.rid = s.rid
           GROUP BY r.i)
 ),
@@ -883,11 +885,23 @@ __rf_tr AS (
         FROM cfr WHERE kind = 'num'
         GROUP BY tree, node, col
      ),
-     rthr AS (
-        SELECT tree, node, col, lo, hi,
-               lo + ((md5_number(seed || ':RT:' || tree || ':' || node || ':' || col)
-                      % 9007199254740992::UHUGEINT)::DOUBLE / 9007199254740992.0) * (hi - lo) AS thr
+     rdraw AS (
+        SELECT *, (md5_number(seed || ':RT:' || tree || ':' || node || ':' || col)
+                      % 9007199254740992::UHUGEINT)::DOUBLE / 9007199254740992.0 AS u
         FROM rlohi
+     ),
+     rinterp AS (
+        SELECT *, CASE WHEN isfinite(hi - lo) THEN lo + u * (hi - lo)
+                       ELSE (1.0 - u) * lo + u * hi END AS raw_thr
+        FROM rdraw
+     ),
+     rthr AS (
+        -- Interpolation can round up to hi for adjacent doubles; lo is always
+        -- a valid representable threshold separating the two endpoints.
+        SELECT tree, node, col, lo, hi,
+               CASE WHEN NOT isfinite(raw_thr) OR raw_thr >= hi THEN lo
+                    ELSE greatest(lo, raw_thr) END AS thr
+        FROM rinterp
      ),
      -- Which side each node row is routed to by the random split.
      --   numeric     LEFT iff v <= thr
@@ -1060,9 +1074,9 @@ SELECT t.tree,
        (SELECT list(kind ORDER BY j) FROM __rf_featcols)  AS feature_kinds,
        (SELECT classes FROM __rf_classlist)               AS classes,
        (SELECT h FROM __rf_hash)                          AS train_hash
-FROM __rf_tr t
-CROSS JOIN __rf_chk ck
-WHERE t.tag IN ('split', 'leaf') AND ck.ok
+FROM __rf_chk ck
+LEFT JOIN __rf_tr t ON t.tag IN ('split', 'leaf')
+WHERE ck.ok AND t.tree IS NOT NULL
 ORDER BY t.tree, t.node;
 
 
@@ -1405,7 +1419,7 @@ __rf_inum AS MATERIALIZED (
 ),
 __rf_hash AS (
     SELECT coalesce(sum((md5_number(rowkey) % 4611686018427387847::UHUGEINT)::BIGINT), 0)::HUGEINT AS h
-    FROM (SELECT r.i || '|' || string_agg(s.sval, '|' ORDER BY s.col) AS rowkey
+    FROM (SELECT r.i || '|' || to_json(list(struct_pack(col := s.col, val := s.sval) ORDER BY s.col)) AS rowkey
           FROM __rf_slong s JOIN __rf_inum r ON r.rid = s.rid
           GROUP BY r.i)
 ),
@@ -1947,6 +1961,12 @@ __cv_chk AS (
                            FROM __cv_types WHERE colname != outcome AND kind IS NULL))
              WHEN family = 'regression' AND (SELECT kind FROM __cv_types WHERE colname = outcome) != 'num'
                THEN error('rf_cv: regression outcome must be numeric')
+             WHEN (SELECT count(*) FROM __cv_slong s
+                   JOIN __cv_types t ON t.colname = s.col
+                   SEMI JOIN __cv_complete c ON c.rid = s.rid
+                   WHERE t.kind = 'num' AND (s.col != outcome OR family = 'regression')
+                     AND NOT isfinite(__rf_number(s.sval, t.typename))) > 0
+               THEN error('rf_cv: numeric training cells contain NaN or Inf')
              WHEN k IS NULL OR k < 2 THEN error('rf_cv: k must be >= 2')
              WHEN k > (SELECT count(*) FROM __cv_complete)
                THEN error('rf_cv: k must not exceed the number of complete rows')

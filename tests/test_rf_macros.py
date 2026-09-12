@@ -2299,3 +2299,36 @@ class TestLocalMomentsAndDegenerateScores:
         assert result.importance_std.tolist() == [0.0]
         con.execute('CREATE OR REPLACE TABLE one_cp AS SELECT * FROM cp LIMIT 1')
         assert con.execute("SELECT r2 FROM rf_reg_evaluate('cm','one_cp','y')").fetchone()[0] is None
+
+
+class TestSignedZeroSplits:
+    @pytest.mark.parametrize('family', ['reg', 'class'])
+    def test_numeric_zero_partition_has_both_children(self, con, family):
+        con.execute("CREATE OR REPLACE TABLE sz AS SELECT * FROM (VALUES (-1.0::DOUBLE,0),('-0.0'::DOUBLE,0),('0.0'::DOUBLE,10)) t(x,y)")
+        con.execute(f"CREATE OR REPLACE TABLE zm AS SELECT * FROM rf_{family}_fit('sz','y',n_trees:=1,replace_sample:=false,max_depth:=3)")
+        missing = con.execute('''SELECT count(*) FROM zm p
+            LEFT JOIN zm l ON l.tree=p.tree AND l.node=2*p.node
+            LEFT JOIN zm r ON r.tree=p.tree AND r.node=2*p.node+1
+            WHERE NOT p.is_leaf AND (l.node IS NULL OR r.node IS NULL)''').fetchone()[0]
+        assert missing == 0
+        con.execute('CREATE OR REPLACE TABLE zq AS SELECT 1.0::DOUBLE x')
+        column = 'prediction' if family == 'reg' else 'pred'
+        assert con.execute(f"SELECT {column} FROM rf_{family}_predict('zm','zq')").fetchone()[0] is not None
+
+    @pytest.mark.parametrize('family', ['reg', 'class'])
+    def test_signed_zero_cannot_evade_minimum_leaf_size(self, con, family):
+        con.execute("CREATE OR REPLACE TABLE sz AS SELECT * FROM (VALUES ('-0.0'::DOUBLE,0),('-0.0'::DOUBLE,0),('0.0'::DOUBLE,10),(1.0::DOUBLE,10)) t(x,y)")
+        model = df_run(con, f"SELECT * FROM rf_{family}_fit('sz','y',n_trees:=1,replace_sample:=false,min_samples_leaf:=2)")
+        assert len(model) == 1 and model.is_leaf.iloc[0]
+        assert model.n_rows.iloc[0] == 4
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    @pytest.mark.parametrize('family', ['regression', 'classification'])
+    def test_cv_signed_zero_matches_positive_zero(self, con, macro, family):
+        con.execute("""CREATE OR REPLACE TABLE sz AS SELECT
+            CASE WHEN i%3=0 THEN -1.0::DOUBLE WHEN i%3=1 THEN '-0.0'::DOUBLE ELSE '0.0'::DOUBLE END x,
+            CASE WHEN i%3=2 THEN 10 ELSE 0 END y FROM range(30) t(i)""")
+        con.execute('CREATE OR REPLACE TABLE pz AS SELECT CASE WHEN x=0 THEN 0.0 ELSE x END x,y FROM sz')
+        query = f"SELECT * FROM {macro}('{{}}','y','{family}',[1],k:=2,n_trees:=3,min_samples_leaf:=2)"
+        a, b = df_run(con, query.format('sz')), df_run(con, query.format('pz'))
+        np.testing.assert_allclose(a.cv_error, b.cv_error, atol=1e-12, rtol=0)

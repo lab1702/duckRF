@@ -276,6 +276,10 @@ CREATE OR REPLACE MACRO __rf_r2(n, sse, sst) AS
          WHEN sst = 0 THEN CASE WHEN sse = 0 THEN 1.0 ELSE 0.0 END
          ELSE 1.0 - sse / sst END;
 
+-- SQL numeric equality identifies both signed zeros; bucket identity must too.
+CREATE OR REPLACE MACRO __rf_bucket(v) AS
+    CAST(CASE WHEN v = 0 THEN 0.0 ELSE v END AS VARCHAR);
+
 CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
     CASE crit
       WHEN 'gini'    THEN 1.0 - list_sum(list_transform(vec, lambda x:
@@ -742,7 +746,7 @@ __rf_tr AS (
      -- row contributes to exactly one slot.
      bcnt AS (
         SELECT tree, node, col, kind,
-               CASE WHEN kind = 'num' THEN CAST(v AS VARCHAR) ELSE lv END AS bucket,
+               CASE WHEN kind = 'num' THEN __rf_bucket(v) ELSE lv END AS bucket,
                any_value(v) AS bnum, count(*) AS bn
         FROM cf
         WHERE splitter = 'best'   -- best-split path only; 'random' feeds rbestdef below
@@ -750,7 +754,7 @@ __rf_tr AS (
      ),
      bslot AS (
         SELECT cf.tree, cf.node, cf.col,
-               CASE WHEN cf.kind = 'num' THEN CAST(cf.v AS VARCHAR) ELSE cf.lv END AS bucket,
+               CASE WHEN cf.kind = 'num' THEN __rf_bucket(cf.v) ELSE cf.lv END AS bucket,
                u.slot, list_sum(list(cf.w * u.u ORDER BY cf.rid)) AS s
         FROM cf JOIN nu u ON u.tree = cf.tree AND u.node = cf.node AND u.rid = cf.rid
         GROUP BY cf.tree, cf.node, cf.col, bucket, u.slot
@@ -822,6 +826,7 @@ __rf_tr AS (
         JOIN __rf_featcols f ON f.col = p.col
         JOIN __rf_wroot wr ON wr.tree = p.tree
         WHERE p.nextkey IS NOT NULL              -- a prefix boundary needs a right side
+          AND (f.kind != 'num' OR p.skey < p.nextkey)
           AND p.nl >= min_samples_leaf
           AND s.nrows - p.nl >= min_samples_leaf
      ),
@@ -2127,11 +2132,11 @@ __cv_tr AS (
             FROM cur c JOIN mt m ON m.g=c.g AND m.tree=c.tree AND m.node=c.node
             JOIN __cv_feat f ON f.rid=c.rid AND f.col=m.col),
      bcnt AS (SELECT g, tree, node, col, kind,
-                     CASE WHEN kind='num' THEN CAST(v AS VARCHAR) ELSE lv END AS bucket,
+                     CASE WHEN kind='num' THEN __rf_bucket(v) ELSE lv END AS bucket,
                      any_value(v) AS bnum, count(*) AS bn
               FROM cf GROUP BY g, tree, node, col, kind, bucket),
      bslot AS (SELECT cf.g, cf.tree, cf.node, cf.col,
-                      CASE WHEN cf.kind='num' THEN CAST(cf.v AS VARCHAR) ELSE cf.lv END AS bucket,
+                      CASE WHEN cf.kind='num' THEN __rf_bucket(cf.v) ELSE cf.lv END AS bucket,
                       u.slot, sum(cf.w*u.u) AS s
                FROM cf JOIN nu u ON u.g=cf.g AND u.tree=cf.tree AND u.node=cf.node AND u.rid=cf.rid
                GROUP BY cf.g, cf.tree, cf.node, cf.col, bucket, u.slot),
@@ -2166,7 +2171,8 @@ __cv_tr AS (
                      s.depth AS depth, s.pvec, s.qpar, s.wn AS wn, wr.w_root
               FROM pref p JOIN sn s ON s.g=p.g AND s.tree=p.tree AND s.node=p.node
               JOIN __cv_wroot wr ON wr.g=p.g AND wr.tree=p.tree
-              WHERE p.nextkey IS NOT NULL AND p.nl >= min_samples_leaf
+              WHERE p.nextkey IS NOT NULL AND (p.kind != 'num' OR p.skey < p.nextkey)
+                AND p.nl >= min_samples_leaf
                 AND s.nrows - p.nl >= min_samples_leaf),
      scored AS (SELECT c.*, __rf_q(c.lvec,(SELECT crit FROM __cv_crit))
                             + __rf_q(c.rvec,(SELECT crit FROM __cv_crit)) - c.qpar AS gain

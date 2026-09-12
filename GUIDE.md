@@ -354,6 +354,9 @@ SELECT * FROM rf_reg_evaluate('rmodel', 'penguins', 'body_mass_g');
 
 - `rmse` = `sqrt(mean (y − ŷ)²)`, `mae` = `mean |y − ŷ|`.
 - `r2` = `1 − SSE/SST` with `SST = sum (y − mean(y))²` (sklearn's `r2_score`).
+  For a constant target with at least two scored rows, it is 1 for perfect
+  predictions and 0 otherwise; fewer than two scored rows yields `NULL`.
+  Permutation importance uses the same scoring convention.
 
 **Classification** → `n, accuracy, log_loss, brier, auc`:
 

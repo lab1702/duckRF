@@ -1783,21 +1783,22 @@ def _grow_et(df, feats, kinds, family, crit, seed, max_depth, mss=2, msl=1, mtry
     if family == "classification":
         yv = df["y"].astype(str).to_numpy(); classes = sorted(set(yv))
     else:
-        yraw = df["y"].to_numpy(dtype=float); ybar = float(yraw.mean()); yc = yraw - ybar
+        yraw = df["y"].to_numpy(dtype=float)
     w_root = float(n)
 
-    def slots(idx):
+    def slots(idx, center=0.0):
         if family == "classification":
             return [float((yv[idx] == c).sum()) for c in classes]
-        ys = yc[idx]; return [float(len(idx)), float(ys.sum()), float((ys * ys).sum())]
+        ys = yraw[idx] - center; return [float(len(idx)), float(ys.sum()), float((ys * ys).sum())]
 
     out, stack = {}, [(1, 0, np.arange(n))]
     while stack:
         node, depth, idx = stack.pop()
-        pvec = slots(idx); nrows = len(idx); impurity = _et_imp(pvec, crit)
+        center = 0.0 if family == "classification" else float(yraw[idx.min()])
+        pvec = slots(idx, center); nrows = len(idx); impurity = _et_imp(pvec, crit)
         rec = dict(is_leaf=True, split_feature=None, split_kind=None, threshold=None,
                    cats_left=None, cats_right=None, impurity=impurity, n_rows=nrows,
-                   prediction=(None if family == "classification" else pvec[1] / pvec[0] + ybar),
+                   prediction=(None if family == "classification" else pvec[1] / pvec[0] + center),
                    class_counts=({c: pvec[i] for i, c in enumerate(classes)}
                                  if family == "classification" else None))
         if depth < depth_eff and nrows >= mss and impurity > EPS_:
@@ -1826,7 +1827,7 @@ def _grow_et(df, feats, kinds, family, crit, seed, max_depth, mss=2, msl=1, mtry
                     payload = ("cat", None, sorted(lset), sorted(L for L in levels if L not in lset))
                 nl = int(lmask.sum()); nr = nrows - nl
                 if nl < msl or nr < msl: continue
-                lvec = slots(idx[lmask]); rvec = [pvec[i] - lvec[i] for i in range(len(pvec))]
+                lvec = slots(idx[lmask], center); rvec = [pvec[i] - lvec[i] for i in range(len(pvec))]
                 gain = _et_Q(lvec, crit) + _et_Q(rvec, crit) - qpar
                 if not math.isfinite(gain) or gain / w_root + EPS_ < 0.0: continue
                 cands.append((gain, f, payload, lmask))
@@ -1896,7 +1897,7 @@ class TestExtraTrees:
         con.execute("CREATE OR REPLACE TABLE m AS SELECT * FROM rf_reg_fit('t','y', n_trees:=2, splitter:='random')")
         assert df_run(con, "SELECT splitter FROM rf_summary('m')").splitter[0] == "random"
 
-    # Regression carries FRACTIONAL slots (y is centered by a fractional mean),
+    # Regression carries fractional slots centered at each node,
     # so deep in the tree two candidate random splits can be tied in gain within
     # float noise and duckDB's hash-agg summation order (vs numpy's) resolves the
     # tie differently -- the associativity the library documents. The replay is
@@ -2241,3 +2242,60 @@ class TestReplayAndMetricBoundaries:
         con.execute("CREATE OR REPLACE TABLE lq AS SELECT * FROM (VALUES (0,'c'),(1,'b')) t(x,y)")
         with pytest.raises(DuckDBError, match='labels absent from the model classes'):
             df_run(con, "SELECT * FROM rf_class_evaluate('lm','lq','y')")
+
+
+class TestLocalMomentsAndDegenerateScores:
+    @pytest.mark.parametrize('splitter', ['best', 'random'])
+    @pytest.mark.parametrize('reverse', [False, True])
+    def test_outlier_does_not_make_child_pure(self, con, splitter, reverse):
+        data = pd.DataFrame({'x': [0, 1, 2, 3], 'y': [0.0, 1.0, 2.0, 1e9]})
+        if reverse:
+            data = pd.DataFrame({'x': [3, 2, 1, 0], 'y': [1e9, 2.0, 1.0, 0.0]})
+        _load(con, 'ot', data)
+        con.execute(f"CREATE OR REPLACE TABLE om AS SELECT * FROM rf_reg_fit('ot','y',n_trees:=1,replace_sample:=false,max_depth:=NULL,splitter:='{splitter}')")
+        predictions = df_run(con, "SELECT prediction FROM rf_reg_predict('om','ot')").prediction
+        sk = DecisionTreeRegressor(random_state=0).fit(data[['x']], data.y)
+        np.testing.assert_allclose(predictions, sk.predict(data[['x']]), atol=1e-12, rtol=0)
+        assert con.execute('SELECT count(*) FROM om').fetchone()[0] == 7
+
+    @pytest.mark.parametrize('macro, grid', [('rf_cv', '[1]'), ('rf_cv_depth', '[10]')])
+    def test_cv_outlier_child_precision(self, con, macro, grid):
+        con.execute('''CREATE OR REPLACE TABLE ocv AS
+            SELECT (i//2)%4 x, CASE WHEN (i//2)%4=3 THEN 1e9 ELSE (i//2)%4 END y
+            FROM range(80) t(i)''')
+        result = df_run(con, f"SELECT * FROM {macro}('ocv','y','regression',{grid},k:=2,n_trees:=3)")
+        assert result.cv_error.iloc[0] == pytest.approx(0.0, abs=1e-12)
+
+    @pytest.mark.parametrize('truth', [0.0, 1.0])
+    def test_constant_target_r2_matches_sklearn(self, con, truth):
+        con.execute('CREATE OR REPLACE TABLE rt AS SELECT i x, 0.0 y FROM range(3) t(i)')
+        con.execute("CREATE OR REPLACE TABLE rm AS SELECT * FROM rf_reg_fit('rt','y',n_trees:=1,replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE rq AS SELECT i x, ? y FROM range(3) t(i)', [truth])
+        got = df_run(con, "SELECT * FROM rf_reg_evaluate('rm','rq','y')").r2.iloc[0]
+        assert got == r2_score(np.full(3, truth), np.zeros(3))
+
+    @pytest.mark.parametrize('argument', ['seed:=NULL', 'n_repeats:=NULL'])
+    def test_null_permutation_configuration_errors(self, con, argument):
+        con.execute('CREATE OR REPLACE TABLE pt AS SELECT i x, i y FROM range(10) t(i)')
+        con.execute("CREATE OR REPLACE TABLE pm AS SELECT * FROM rf_reg_fit('pt','y',n_trees:=1,replace_sample:=false)")
+        with pytest.raises(DuckDBError, match=argument.split(':=')[0]):
+            df_run(con, f"SELECT * FROM rf_permutation_importance('pm','pt','y',{argument})")
+
+    def test_null_scoring_policy_errors(self, con):
+        con.execute('CREATE OR REPLACE TABLE pt AS SELECT i x, i y FROM range(3) t(i)')
+        con.execute("CREATE OR REPLACE TABLE pm AS SELECT * FROM rf_reg_fit('pt','y',n_trees:=1)")
+        with pytest.raises(DuckDBError, match='na_action'):
+            df_run(con, "SELECT * FROM rf_reg_predict('pm','pt',na_action:=NULL)")
+
+    def test_null_batch_family_errors(self, con):
+        with pytest.raises(DuckDBError, match='family'):
+            con.execute("SELECT rf_batched_fit_sql('t','y',NULL)").fetchall()
+
+    def test_constant_target_permutation_score_is_finite(self, con):
+        con.execute('CREATE OR REPLACE TABLE cp AS SELECT i x, 0.0 y FROM range(3) t(i)')
+        con.execute("CREATE OR REPLACE TABLE cm AS SELECT * FROM rf_reg_fit('cp','y',n_trees:=1,replace_sample:=false)")
+        result = df_run(con, "SELECT * FROM rf_permutation_importance('cm','cp','y',n_repeats:=2)")
+        assert result.importance.tolist() == [0.0]
+        assert result.importance_std.tolist() == [0.0]
+        con.execute('CREATE OR REPLACE TABLE one_cp AS SELECT * FROM cp LIMIT 1')
+        assert con.execute("SELECT r2 FROM rf_reg_evaluate('cm','one_cp','y')").fetchone()[0] is None

@@ -271,6 +271,11 @@ CREATE OR REPLACE MACRO __rf_number(sval, typename) AS
     CASE WHEN typename = 'BOOLEAN' THEN CASE sval WHEN 'true' THEN 1.0 WHEN 'false' THEN 0.0 END
          ELSE TRY_CAST(sval AS DOUBLE) END;
 
+CREATE OR REPLACE MACRO __rf_r2(n, sse, sst) AS
+    CASE WHEN n < 2 THEN NULL
+         WHEN sst = 0 THEN CASE WHEN sse = 0 THEN 1.0 ELSE 0.0 END
+         ELSE 1.0 - sse / sst END;
+
 CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
     CASE crit
       WHEN 'gini'    THEN 1.0 - list_sum(list_transform(vec, lambda x:
@@ -278,10 +283,9 @@ CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
       WHEN 'entropy' THEN -list_sum(list_transform(vec, lambda x:
                               CASE WHEN x > 0 THEN (x / list_sum(vec)) * log2(x / list_sum(vec))
                                    ELSE 0.0 END))
-      -- variance, floored at 0: computed on the GLOBALLY CENTERED outcome (see
-      -- __rf_ybar), so the E[y^2] - E[y]^2 cancellation that ruins split choice
-      -- on large-mean targets (prices, counts, years) cannot bite. Centering is
-      -- exactly gain-invariant.
+      -- Variance, floored at zero, uses node-local centered responses.
+      -- Re-centering each child keeps a removed outlier from erasing its
+      -- response variation; translation leaves exact-arithmetic gain unchanged.
       ELSE greatest(vec[3] / vec[1] - (vec[2] / vec[1]) * (vec[2] / vec[1]), 0.0)
     END
 );
@@ -505,20 +509,9 @@ __rf_wcol AS (
     FROM __rf_rows r
     LEFT JOIN __rf_slong s ON s.rid = r.rid AND s.col = coalesce(weights_col, '')
 ),
--- Mean of the positive-weight regression outcomes. The outcome is fit on
--- y - ybar throughout and ybar is added back into the leaf prediction: gain and
--- impurity are provably invariant to shifting y, but the naive
--- sum(w*y^2) - sum(w*y)^2/W form loses catastrophic precision when
--- |mean(y)| >> sd(y) (prices, revenue, counts, years) -- enough to pick a
--- genuinely WORSE split than the true argmax. One extra pass buys exactness.
-__rf_ybar AS (
-    SELECT CASE WHEN family = 'regression' THEN coalesce(avg(y.yv), 0.0) ELSE 0.0 END AS ybar
-    FROM __rf_ysval y JOIN __rf_rows r ON r.rid = y.rid
-    JOIN __rf_wcol w ON w.rid = r.i
-    WHERE w.w > 0
-),
+-- Preserve raw responses so each node can center them without inherited rounding.
 __rf_y AS MATERIALIZED (
-    SELECT r.i AS rid, y.sval AS cls, y.yv - (SELECT ybar FROM __rf_ybar) AS yv
+    SELECT r.i AS rid, y.sval AS cls, y.yv AS yv
     FROM __rf_ysval y JOIN __rf_rows r ON r.rid = y.rid
 ),
 __rf_cw AS (
@@ -558,11 +551,7 @@ __rf_S AS (SELECT count(*)::BIGINT AS ns FROM __rf_slots),
 __rf_u AS MATERIALIZED (
     SELECT y.rid, c.k AS slot, 1.0::DOUBLE AS u
     FROM __rf_y y JOIN __rf_classes c ON c.cls = y.cls
-    UNION ALL
-    SELECT y.rid, s.slot,
-           CASE s.slot WHEN 1 THEN 1.0::DOUBLE WHEN 2 THEN y.yv ELSE y.yv * y.yv END
-    FROM __rf_y y CROSS JOIN (SELECT unnest([1, 2, 3]) AS slot) s
-    WHERE family = 'regression'
+
 ),
 -- Feature cells, renumbered, split into a numeric value v and a level lv.
 __rf_feat AS MATERIALIZED (
@@ -669,11 +658,30 @@ __rf_tr AS (
   UNION ALL
     (
      WITH cur AS (SELECT tree, node, depth, rid, w FROM __rf_tr WHERE tag = 'assign'),
+     -- A deterministic observed response is an exact local origin. Recompute it
+     -- from raw responses at each node: a remote outlier must not erase the
+     -- small differences in a child after that outlier has split away.
+     ncenter AS (
+        SELECT c.tree, c.node, first(y.yv ORDER BY c.rid) AS center
+        FROM cur c JOIN __rf_y y ON y.rid = c.rid
+        WHERE family = 'regression' GROUP BY c.tree, c.node
+     ),
+     nu AS (
+        SELECT c.tree, c.node, c.rid, u.slot, u.u
+        FROM cur c JOIN __rf_u u ON u.rid = c.rid
+        UNION ALL
+        SELECT c.tree, c.node, c.rid, sl.slot,
+               CASE sl.slot WHEN 1 THEN 1.0 WHEN 2 THEN y.yv - nc.center
+                    ELSE (y.yv - nc.center) * (y.yv - nc.center) END AS u
+        FROM cur c JOIN __rf_y y ON y.rid = c.rid
+        JOIN ncenter nc ON nc.tree = c.tree AND nc.node = c.node
+        CROSS JOIN (SELECT unnest([1,2,3]) AS slot) sl
+     ),
      -- Sparse slot sums, then densified against the full slot list: a class
      -- absent from a node must still occupy its position in the vector.
      nsl AS (
-        SELECT c.tree, c.node, u.slot, sum(c.w * u.u) AS s
-        FROM cur c JOIN __rf_u u ON u.rid = c.rid
+        SELECT c.tree, c.node, u.slot, list_sum(list(c.w * u.u ORDER BY c.rid)) AS s
+        FROM cur c JOIN nu u ON u.tree = c.tree AND u.node = c.node AND u.rid = c.rid
         GROUP BY c.tree, c.node, u.slot
      ),
      ns AS (
@@ -687,10 +695,11 @@ __rf_tr AS (
         GROUP BY g.tree, g.node
      ),
      nstat AS (
-        SELECT ns.tree, ns.node, ns.depth, ns.nrows, ns.wn, v.pvec,
+        SELECT ns.tree, ns.node, ns.depth, ns.nrows, ns.wn, v.pvec, coalesce(nc.center, 0.0) AS center,
                __rf_imp(v.pvec, criterion) AS imp,
                __rf_q(v.pvec, criterion)   AS qpar
         FROM ns JOIN nvec v ON v.tree = ns.tree AND v.node = ns.node
+        LEFT JOIN ncenter nc ON nc.tree = ns.tree AND nc.node = ns.node
      ),
      -- Splittable nodes. The purity test is on the NORMALIZED impurity against
      -- DBL_EPSILON, exactly as sklearn's (impurity <= EPSILON); comparing a
@@ -742,8 +751,8 @@ __rf_tr AS (
      bslot AS (
         SELECT cf.tree, cf.node, cf.col,
                CASE WHEN cf.kind = 'num' THEN CAST(cf.v AS VARCHAR) ELSE cf.lv END AS bucket,
-               u.slot, sum(cf.w * u.u) AS s
-        FROM cf JOIN __rf_u u ON u.rid = cf.rid
+               u.slot, list_sum(list(cf.w * u.u ORDER BY cf.rid)) AS s
+        FROM cf JOIN nu u ON u.tree = cf.tree AND u.node = cf.node AND u.rid = cf.rid
         GROUP BY cf.tree, cf.node, cf.col, bucket, u.slot
      ),
      bvec AS (
@@ -916,8 +925,8 @@ __rf_tr AS (
      ),
      -- Left slot sums (sparse) and left row-count / weight, per candidate feature.
      rlslot AS (
-        SELECT m.tree, m.node, m.col, u.slot, sum(m.w * u.u) AS s
-        FROM rmemb m JOIN __rf_u u ON u.rid = m.rid
+        SELECT m.tree, m.node, m.col, u.slot, list_sum(list(m.w * u.u ORDER BY m.rid)) AS s
+        FROM rmemb m JOIN nu u ON u.tree = m.tree AND u.node = m.node AND u.rid = m.rid
         WHERE m.goleft
         GROUP BY m.tree, m.node, m.col, u.slot
      ),
@@ -1007,7 +1016,7 @@ __rf_tr AS (
      -- leaves: every current node with no admissible split. class_counts is
      -- DENSE over the training classes (zeros included) so that predict can
      -- average probability vectors across trees key by key; prediction adds the
-     -- global mean back on (the forest was fit on the centered outcome).
+     -- node-local origin back on (moments use centered responses).
      SELECT 'leaf', s.tree, s.node, s.depth, NULL::BIGINT, NULL::DOUBLE,
             struct_pack(
               split_feature := NULL::VARCHAR,
@@ -1021,7 +1030,7 @@ __rf_tr AS (
               impurity      := s.imp,
               imp_decrease  := NULL::DOUBLE,
               prediction    := CASE WHEN family = 'regression'
-                                    THEN s.pvec[2] / s.pvec[1] + (SELECT ybar FROM __rf_ybar) END,
+                                    THEN s.pvec[2] / s.pvec[1] + s.center END,
               class_counts  := CASE WHEN family = 'classification'
                                     THEN map_from_entries(list_transform(
                                            (SELECT classes FROM __rf_classlist),
@@ -1198,7 +1207,7 @@ CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100,
     FROM range(1, CAST(ceil(n_trees::DOUBLE / greatest(batch_size, 1)) AS BIGINT) + 1) g(i)
   )
   SELECT CASE
-           WHEN family NOT IN ('classification', 'regression')
+           WHEN family IS NULL OR family NOT IN ('classification', 'regression')
              THEN error('rf_batched_fit_sql: family must be ''classification'' or ''regression'', got '''
                         || coalesce(family, 'NULL') || '''')
            WHEN n_trees < 1
@@ -1354,8 +1363,8 @@ __rf_chk AS (
              WHEN caller IN ('rf_reg_predict', 'rf_reg_oob_predict')
                   AND (SELECT count(*) FROM __rf_types WHERE lower(colname) = 'prediction') > 0
                THEN error(caller || ': the input table already has a "prediction" column, which collides with the output column; rename or drop it first (e.g. SELECT * EXCLUDE (prediction))')
-             WHEN na_action NOT IN ('null', 'skip_tree')
-               THEN error(caller || ': na_action must be ''null'' or ''skip_tree'', got ''' || na_action || '''')
+             WHEN na_action IS NULL OR na_action NOT IN ('null', 'skip_tree')
+               THEN error(caller || ': na_action must be ''null'' or ''skip_tree'', got ''' || coalesce(na_action, 'NULL') || '''')
              WHEN n_trees IS NOT NULL AND n_trees < 1
                THEN error(caller || ': n_trees must be >= 1 (or NULL for every tree), got ' || n_trees)
              ELSE true
@@ -1673,7 +1682,7 @@ __rf_agg AS (
 ),
 __rf_sst AS (SELECT sum((y - a.ybar) * (y - a.ybar)) AS sst FROM __rf_rows r, __rf_agg a)
 SELECT a.n::BIGINT AS n, sqrt(a.sse / a.n) AS rmse, a.sae / a.n AS mae,
-       1.0 - a.sse / s.sst AS r2
+       __rf_r2(a.n, a.sse, s.sst) AS r2
 FROM __rf_agg a, __rf_sst s, __rf_ck ck
 WHERE ck.ok;
 
@@ -2007,9 +2016,8 @@ __cv_ysval AS MATERIALIZED (
            __rf_number(s.sval, (SELECT typename FROM __cv_types WHERE colname = outcome)) AS yv
     FROM __cv_slong s JOIN __cv_rows r ON r.rid = s.rid WHERE s.col = outcome
 ),
-__cv_ybar AS (SELECT CASE WHEN family = 'regression' THEN avg(yv) ELSE 0.0 END AS ybar FROM __cv_ysval),
 __cv_y AS MATERIALIZED (
-    SELECT rid, cls, yv - (SELECT ybar FROM __cv_ybar) AS yv FROM __cv_ysval
+    SELECT rid, cls, yv FROM __cv_ysval
 ),
 __cv_classes AS MATERIALIZED (
     SELECT cls, row_number() OVER (ORDER BY cls) AS kk
@@ -2024,9 +2032,7 @@ __cv_crit AS (SELECT CASE WHEN family = 'classification' THEN 'gini' ELSE 'mse' 
 __cv_u AS MATERIALIZED (
     SELECT y.rid, c.kk AS slot, 1.0::DOUBLE AS u
     FROM __cv_y y JOIN __cv_classes c ON c.cls = y.cls
-    UNION ALL
-    SELECT y.rid, s.slot, CASE s.slot WHEN 1 THEN 1.0 WHEN 2 THEN y.yv ELSE y.yv*y.yv END
-    FROM __cv_y y CROSS JOIN (SELECT unnest([1,2,3]) AS slot) s WHERE family = 'regression'
+
 ),
 __cv_feat AS MATERIALIZED (
     SELECT r.i AS rid, s.col, f.kind,
@@ -2078,17 +2084,34 @@ __cv_tr AS (
   UNION ALL
     (
      WITH cur AS (SELECT g, tree, node, depth, rid, w FROM __cv_tr WHERE tag = 'assign'),
+     ncenter AS (
+        SELECT c.g, c.tree, c.node, first(y.yv ORDER BY c.rid) AS center
+        FROM cur c JOIN __cv_y y ON y.rid=c.rid
+        WHERE family='regression' GROUP BY c.g,c.tree,c.node
+     ),
+     nu AS (
+        SELECT c.g,c.tree,c.node,c.rid,u.slot,u.u
+        FROM cur c JOIN __cv_u u ON u.rid=c.rid
+        UNION ALL
+        SELECT c.g,c.tree,c.node,c.rid,sl.slot,
+               CASE sl.slot WHEN 1 THEN 1.0 WHEN 2 THEN y.yv-nc.center
+                    ELSE (y.yv-nc.center)*(y.yv-nc.center) END AS u
+        FROM cur c JOIN __cv_y y ON y.rid=c.rid
+        JOIN ncenter nc ON nc.g=c.g AND nc.tree=c.tree AND nc.node=c.node
+        CROSS JOIN (SELECT unnest([1,2,3]) AS slot) sl
+     ),
      nsl AS (SELECT c.g, c.tree, c.node, u.slot, sum(c.w*u.u) AS s
-             FROM cur c JOIN __cv_u u ON u.rid = c.rid GROUP BY c.g, c.tree, c.node, u.slot),
+             FROM cur c JOIN nu u ON u.g=c.g AND u.tree=c.tree AND u.node=c.node AND u.rid=c.rid GROUP BY c.g, c.tree, c.node, u.slot),
      ns AS (SELECT g, tree, node, any_value(depth) AS depth, count(*) AS nrows, sum(w) AS wn
             FROM cur GROUP BY g, tree, node),
      nvec AS (SELECT gg.g, gg.tree, gg.node, list(coalesce(x.s,0.0) ORDER BY gg.slot) AS pvec
               FROM (SELECT n.g, n.tree, n.node, s.slot FROM ns n CROSS JOIN __cv_slots s) gg
               LEFT JOIN nsl x ON x.g=gg.g AND x.tree=gg.tree AND x.node=gg.node AND x.slot=gg.slot
               GROUP BY gg.g, gg.tree, gg.node),
-     nstat AS (SELECT ns.*, v.pvec, __rf_imp(v.pvec,(SELECT crit FROM __cv_crit)) AS imp,
+     nstat AS (SELECT ns.*, v.pvec, coalesce(nc.center,0.0) AS center, __rf_imp(v.pvec,(SELECT crit FROM __cv_crit)) AS imp,
                       __rf_q(v.pvec,(SELECT crit FROM __cv_crit)) AS qpar
-               FROM ns JOIN nvec v ON v.g=ns.g AND v.tree=ns.tree AND v.node=ns.node),
+               FROM ns JOIN nvec v ON v.g=ns.g AND v.tree=ns.tree AND v.node=ns.node
+               LEFT JOIN ncenter nc ON nc.g=ns.g AND nc.tree=ns.tree AND nc.node=ns.node),
      sn AS (SELECT s.*, gr.mtry_g, gr.depth_g FROM nstat s JOIN __cv_groups gr ON gr.g = s.g
             WHERE s.depth < gr.depth_g AND s.nrows >= 2 AND s.imp > 2.220446049250313e-16),
      nonconst AS (SELECT c.g, c.tree, c.node, f.col, f.kind
@@ -2110,7 +2133,7 @@ __cv_tr AS (
      bslot AS (SELECT cf.g, cf.tree, cf.node, cf.col,
                       CASE WHEN cf.kind='num' THEN CAST(cf.v AS VARCHAR) ELSE cf.lv END AS bucket,
                       u.slot, sum(cf.w*u.u) AS s
-               FROM cf JOIN __cv_u u ON u.rid=cf.rid
+               FROM cf JOIN nu u ON u.g=cf.g AND u.tree=cf.tree AND u.node=cf.node AND u.rid=cf.rid
                GROUP BY cf.g, cf.tree, cf.node, cf.col, bucket, u.slot),
      bvec AS (SELECT b.g, b.tree, b.node, b.col, b.kind, b.bucket, b.bnum, b.bn,
                      list(coalesce(x.s,0.0) ORDER BY gg.slot) AS bv
@@ -2167,7 +2190,7 @@ __cv_tr AS (
      SELECT 'leaf', s.g, s.tree, s.node, s.depth, NULL::BIGINT, NULL::DOUBLE,
             struct_pack(col:=NULL::VARCHAR, kind:=NULL::VARCHAR, thr:=NULL::DOUBLE,
                         cats_left:=NULL::VARCHAR[], cats_right:=NULL::VARCHAR[], unseen_left:=NULL::BOOLEAN,
-                        pred:=CASE WHEN family='regression' THEN s.pvec[2]/s.pvec[1]+(SELECT ybar FROM __cv_ybar) END,
+                        pred:=CASE WHEN family='regression' THEN s.pvec[2]/s.pvec[1]+s.center END,
                         cc:=CASE WHEN family='classification' THEN map_from_entries(list_transform(
                               (SELECT classes FROM __cv_classlist), lambda c,jj: struct_pack(key:=c, value:=s.pvec[jj]))) END)
      FROM nstat s
@@ -2356,8 +2379,9 @@ __rf_chk AS (
                THEN error('rf_permutation_importance: column names beginning with "__rf_" are reserved for internal use; please rename')
              WHEN (SELECT n_model_rows FROM __rf_meta) = 0
                THEN error('rf_permutation_importance: model table "' || model || '" is empty')
-             WHEN n_repeats < 1
-               THEN error('rf_permutation_importance: n_repeats must be >= 1, got ' || n_repeats)
+             WHEN seed IS NULL THEN error('rf_permutation_importance: seed must not be NULL')
+             WHEN n_repeats IS NULL OR n_repeats < 1
+               THEN error('rf_permutation_importance: n_repeats must be >= 1, got ' || coalesce(n_repeats::VARCHAR, 'NULL'))
              WHEN (SELECT count(*) FROM __rf_types WHERE colname = outcome) = 0
                THEN error('rf_permutation_importance: outcome column "' || outcome || '" not found in "' || tbl || '"')
              ELSE true
@@ -2519,15 +2543,15 @@ __rf_clspred AS (
     SELECT pf, rep, rid, (list(cls ORDER BY p DESC, cls))[1] AS pred
     FROM __rf_clsprob GROUP BY pf, rep, rid
 ),
--- Score per job. Regression R^2 = 1 - SSE/SST (NULL if SST = 0), SSE summed in
+-- Score per job. Regression R^2 uses sklearn's finite constant-target convention, SSE summed in
 -- rid order. Classification accuracy = mean[pred = y] (a sum of 0/1 ints, exact
 -- and order-independent). Only the model's family produces rows (the other
 -- branch's predictions are all-NULL / empty and are filtered out here).
 __rf_regscore AS (
     SELECT p.pf, p.rep,
-           CASE WHEN (SELECT sst FROM __rf_sst) = 0 THEN NULL
-                ELSE 1.0 - list_sum(list((y.yv - p.yhat) * (y.yv - p.yhat) ORDER BY p.rid))
-                           / (SELECT sst FROM __rf_sst) END AS score
+           __rf_r2(count(*),
+                   list_sum(list((y.yv - p.yhat) * (y.yv - p.yhat) ORDER BY p.rid)),
+                   (SELECT sst FROM __rf_sst)) AS score
     FROM __rf_regpred p JOIN __rf_yset y ON y.rid = p.rid
     GROUP BY p.pf, p.rep
 ),

@@ -53,7 +53,7 @@ Both families take the identical argument list:
 | `sample_frac` | `1.0` | bootstrap sample size as a fraction of *n* (`0 < sample_frac <= 1`, sklearn's `max_samples`) |
 | `replace_sample` | `true` | sample with replacement (bagging); `false` draws a random subset without replacement |
 | `criterion` | `'gini'` / `'mse'` | `'gini'` or `'entropy'` (in **bits**, log base 2, as sklearn's) for classification; `'mse'` for regression |
-| `seed` | `42` | all randomness is `md5_number(seed || …)`; must not be `NULL` |
+| `seed` | `42` | cast to BIGINT before all RNG draws and metadata storage; must not be `NULL` |
 | `weights_col` | `NULL` | column of non-negative per-row sample weights (multiplies the bootstrap count — sklearn's `sample_weight`) |
 | `class_weight` | `NULL` | classification only; `'balanced'` multiplies each row's weight by `n / (K · n_k)` |
 | `splitter` | `'best'` | `'best'` = Random Forest (search for the best split); `'random'` = **Extra Trees** (one random split per candidate feature). See [below](#extra-trees) |
@@ -413,6 +413,9 @@ SELECT * FROM rf_reg_oob('rmodel', 'penguins', 'body_mass_g');
 -- │ 300 │ 249.47 │ 206.51 │ 0.8624 │          0 │
 -- └─────┴────────┴────────┴────────┴────────────┘
 ```
+
+Classification evaluation rejects scored outcome labels absent from the model
+classes, since its probability metrics are defined over those classes.
 
 **The exact-training-table requirement.** OOB reconstructs each tree's bootstrap
 membership from the model metadata (`seed`, `sample_frac`, `replace_sample`,

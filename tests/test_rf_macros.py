@@ -1394,8 +1394,9 @@ def _wquantile_type1(ys, ws, alphas):
     order = np.argsort(ys, kind="mergesort")  # stable, ties by original order
     ys_s = np.asarray(ys, float)[order]
     ws_s = np.asarray(ws, float)[order]
-    ws_s = ws_s / ws_s.sum()
-    cw = np.cumsum(ws_s)
+    # Accumulate raw weights before normalizing: unit weights then use exact
+    # integer counts, avoiding cumsum(1/n) drifting across a type-1 boundary.
+    cw = np.cumsum(ws_s) / ws_s.sum()
     return {a: ys_s[int(np.argmax(cw >= a))] for a in alphas}
 
 
@@ -2210,3 +2211,33 @@ class TestTrainingBoundaryContracts:
         con.execute(f"UPDATE nf SET {column}='{value}'::DOUBLE WHERE x=0")
         with pytest.raises(DuckDBError, match='NaN or Inf'):
             df_run(con, f"SELECT * FROM {macro}('nf','y','regression',[1],k:=2,n_trees:=2)")
+
+
+class TestReplayAndMetricBoundaries:
+    @pytest.mark.parametrize('replace_sample', ['true', 'false'])
+    @pytest.mark.parametrize('splitter', ['best', 'random'])
+    def test_decimal_seed_matches_integer_model_and_oob(self, con, replace_sample, splitter):
+        con.execute('CREATE OR REPLACE TABLE ds AS SELECT i x, i y FROM range(10) t(i)')
+        for seed, model in [('42', 'si'), ('42.0', 'sd')]:
+            con.execute(f"""CREATE OR REPLACE TABLE {model} AS SELECT * FROM rf_reg_fit('ds','y',
+                n_trees:=3,seed:={seed},sample_frac:=0.7,replace_sample:={replace_sample},splitter:='{splitter}')""")
+        pd.testing.assert_frame_equal(df_run(con, 'SELECT * FROM si'), df_run(con, 'SELECT * FROM sd'))
+        pd.testing.assert_frame_equal(df_run(con, "SELECT * FROM rf_reg_oob_predict('si','ds')"),
+                                      df_run(con, "SELECT * FROM rf_reg_oob_predict('sd','ds')"))
+
+    @pytest.mark.parametrize('n', [10, 20])
+    def test_quantile_type_one_boundaries(self, con, n):
+        con.execute(f'CREATE OR REPLACE TABLE qb AS SELECT 0 x, i y FROM range({n}) t(i)')
+        con.execute("CREATE OR REPLACE TABLE qbm AS SELECT * FROM rf_reg_fit('qb','y',n_trees:=1,replace_sample:=false)")
+        levels = [0.5, 0.8, 0.9, np.nextafter(1.0, 0.0)]
+        result = con.execute("SELECT quantile_pred FROM rf_reg_quantile('qbm','qb','y',?) LIMIT 1",
+                             [[float(q) for q in levels]]).fetchone()[0]
+        expected = np.quantile(np.arange(n), levels, method='inverted_cdf')
+        np.testing.assert_array_equal([result[float(q)] for q in levels], expected)
+
+    def test_class_evaluate_unknown_labels_error(self, con):
+        con.execute("CREATE OR REPLACE TABLE lc AS SELECT * FROM (VALUES (0,'a'),(1,'b')) t(x,y)")
+        con.execute("CREATE OR REPLACE TABLE lm AS SELECT * FROM rf_class_fit('lc','y',n_trees:=1,replace_sample:=false)")
+        con.execute("CREATE OR REPLACE TABLE lq AS SELECT * FROM (VALUES (0,'c'),(1,'b')) t(x,y)")
+        with pytest.raises(DuckDBError, match='labels absent from the model classes'):
+            df_run(con, "SELECT * FROM rf_class_evaluate('lm','lq','y')")

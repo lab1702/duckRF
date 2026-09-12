@@ -606,7 +606,7 @@ __rf_boot AS MATERIALIZED (
     SELECT t.tree, d.rid, count(*)::DOUBLE * any_value(rw.rw) AS w
     FROM __rf_trees t
     CROSS JOIN LATERAL (
-        SELECT (md5_number(seed || ':' || t.tree || ':' || g.kk)
+        SELECT (md5_number(seed::BIGINT || ':' || t.tree || ':' || g.kk)
                 % (SELECT n FROM __rf_n)::UHUGEINT)::BIGINT + 1 AS rid
         FROM range(1, (SELECT m FROM __rf_m) + 1) g(kk)
     ) d
@@ -623,7 +623,7 @@ __rf_boot AS MATERIALIZED (
         CROSS JOIN __rf_wchk wc
         WHERE NOT replace_sample AND wc.ok
         QUALIFY row_number() OVER (PARTITION BY t.tree
-                                   ORDER BY md5_number(seed || ':' || t.tree || ':' || r.i))
+                                   ORDER BY md5_number(seed::BIGINT || ':' || t.tree || ':' || r.i))
                 <= (SELECT m FROM __rf_m)
     )
 ),
@@ -718,7 +718,7 @@ __rf_tr AS (
         SELECT tree, node, col, kind
         FROM nonconst
         QUALIFY row_number() OVER (PARTITION BY tree, node
-                                   ORDER BY md5_number(seed || ':' || tree || ':' || node || ':' || col))
+                                   ORDER BY md5_number(seed::BIGINT || ':' || tree || ':' || node || ':' || col))
                 <= (SELECT mtry_eff FROM __rf_cfg)
      ),
      -- The node's rows restricted to the sampled features.
@@ -886,7 +886,7 @@ __rf_tr AS (
         GROUP BY tree, node, col
      ),
      rdraw AS (
-        SELECT *, (md5_number(seed || ':RT:' || tree || ':' || node || ':' || col)
+        SELECT *, (md5_number(seed::BIGINT || ':RT:' || tree || ':' || node || ':' || col)
                       % 9007199254740992::UHUGEINT)::DOUBLE / 9007199254740992.0 AS u
         FROM rlohi
      ),
@@ -909,7 +909,7 @@ __rf_tr AS (
      rmemb AS (
         SELECT cf.tree, cf.node, cf.col, cf.kind, cf.rid, cf.w, cf.lv,
                CASE WHEN cf.kind = 'num' THEN (cf.v <= rt.thr)
-                    ELSE (md5_number(seed || ':RC:' || cf.tree || ':' || cf.node || ':' || cf.col || ':' || cf.lv)
+                    ELSE (md5_number(seed::BIGINT || ':RC:' || cf.tree || ':' || cf.node || ':' || cf.col || ':' || cf.lv)
                           % 2::UHUGEINT = 0) END AS goleft
         FROM cfr cf
         LEFT JOIN rthr rt ON rt.tree = cf.tree AND rt.node = cf.node AND rt.col = cf.col AND cf.kind = 'num'
@@ -1713,6 +1713,9 @@ __rf_perrow AS (
 ),
 __rf_ck AS (
     SELECT CASE WHEN (SELECT __rf_famchk(model, caller, 'classification')) IS NULL THEN false
+                WHEN (SELECT count(*) FROM __rf_perrow
+                      WHERE NOT list_contains((SELECT classes FROM __rf_cls), y)) > 0
+                THEN error(caller || ': outcome contains labels absent from the model classes')
                 WHEN (SELECT count(*) FROM __rf_perrow) = 0
                 THEN error(caller || ': no rows with a non-NULL prediction and outcome to evaluate')
                 ELSE true END AS ok
@@ -2691,7 +2694,7 @@ __rf_qtrees AS (
 __rf_dist AS (
     SELECT c.qrid, c.y, c.wsum / qt.ntree AS w
     FROM (
-        SELECT q.rid AS qrid, r.y AS y, sum(1.0 / ln.n_t) AS wsum
+        SELECT q.rid AS qrid, r.y AS y, fsum(1.0 / ln.n_t) AS wsum
         FROM __rf_qwalk q
         JOIN __rf_leafn ln ON ln.tree = q.tree AND ln.node = q.node
         JOIN __rf_ref    r ON r.tree = q.tree AND r.node = q.node
@@ -2700,10 +2703,13 @@ __rf_dist AS (
     JOIN __rf_qtrees qt ON qt.rid = c.qrid
 ),
 -- Cumulative weight over the pooled responses sorted ascending (deterministic:
--- the pooled y are distinct within a query row).
+-- the pooled y are distinct within a query row). Compensated sums avoid
+-- skipped type-1 boundaries, and normalize by the realized total so the final
+-- CDF value is exactly one even after rounding the per-tree weights.
 __rf_cum AS (
     SELECT qrid, y,
-           sum(w) OVER (PARTITION BY qrid ORDER BY y ROWS UNBOUNDED PRECEDING) AS cw
+           fsum(w) OVER (PARTITION BY qrid ORDER BY y ROWS UNBOUNDED PRECEDING)
+             / fsum(w) OVER (PARTITION BY qrid) AS cw
     FROM __rf_dist
 ),
 -- Type-1 inverse CDF: smallest response whose cumulative weight first reaches the

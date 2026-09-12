@@ -506,7 +506,8 @@ __rf_y AS MATERIALIZED (
 -- 'balanced' class weight n / (K * n_k) (sklearn's exact formula; the class
 -- counts are unweighted, as sklearn's compute_class_weight uses bincount(y)).
 __rf_wcol AS (
-    SELECT r.i AS rid, coalesce(TRY_CAST(s.sval AS DOUBLE), 1.0) AS w
+    SELECT r.i AS rid, CASE WHEN weights_col IS NULL THEN 1.0
+                               ELSE TRY_CAST(s.sval AS DOUBLE) END AS w
     FROM __rf_rows r
     LEFT JOIN __rf_slong s ON s.rid = r.rid AND s.col = coalesce(weights_col, '')
 ),
@@ -526,6 +527,8 @@ __rf_rw AS MATERIALIZED (
 ),
 __rf_wchk AS (
     SELECT CASE
+             WHEN count(*) FILTER (WHERE w IS NULL OR NOT isfinite(w)) > 0
+               THEN error(caller || ': weights must be finite numeric values')
              WHEN weights_col IS NOT NULL AND min(w) < 0
                THEN error(caller || ': weights must be non-negative')
              WHEN weights_col IS NOT NULL AND coalesce(sum(w), 0) <= 0
@@ -617,7 +620,10 @@ __rf_boot AS MATERIALIZED (
 -- Root weight per tree: sklearn's "improvement" (what min_impurity_decrease is
 -- compared against) is imp_decrease / w_root, so it must be a per-tree constant.
 __rf_wroot AS MATERIALIZED (
-    SELECT tree, sum(w) AS w_root FROM __rf_boot GROUP BY tree
+    SELECT tree, CASE WHEN sum(w) <= 0 OR NOT isfinite(sum(w))
+                      THEN error(caller || ': sampled tree has zero or non-finite total weight; change seed, increase sample_frac, or use positive weights')
+                      ELSE sum(w) END AS w_root
+    FROM __rf_boot GROUP BY tree
 ),
 -- Order-dependent fingerprint of the training rows. *_oob_* must be handed the
 -- exact table the model was trained on (row identity is the ordinal); with this
@@ -648,7 +654,8 @@ __rf_tr AS (
                         cats_left VARCHAR[], cats_right VARCHAR[], unseen_left BOOLEAN,
                         n_rows BIGINT, w_node DOUBLE, impurity DOUBLE, imp_decrease DOUBLE,
                         prediction DOUBLE, class_counts MAP(VARCHAR, DOUBLE)) AS m
-    FROM __rf_boot b
+    FROM __rf_boot b JOIN __rf_wroot wr ON wr.tree = b.tree
+    WHERE wr.w_root > 0 AND b.w > 0
   UNION ALL
     (
      WITH cur AS (SELECT tree, node, depth, rid, w FROM __rf_tr WHERE tag = 'assign'),
@@ -1350,7 +1357,7 @@ __rf_usable AS MATERIALIZED (
     SELECT * FROM __rf_cells
     WHERE (kind = 'num' AND v IS NOT NULL) OR (kind = 'cat' AND lv IS NOT NULL)
 ),
-__rf_rowids AS (SELECT DISTINCT rid FROM __rf_slong),
+__rf_rowids AS (SELECT row_number() OVER () AS rid FROM query_table(tbl)),
 __rf_full AS (
     SELECT rid FROM __rf_usable
     GROUP BY rid
@@ -1983,7 +1990,7 @@ __cv_groups AS MATERIALIZED (
 ),
 -- Training rows within each group, renumbered 1..m_g for the bootstrap draw.
 __cv_train AS MATERIALIZED (
-    SELECT g.g, r.rid AS i, row_number() OVER (PARTITION BY g.g ORDER BY r.i) AS j
+    SELECT g.g, r.i AS i, row_number() OVER (PARTITION BY g.g ORDER BY r.i) AS j
     FROM __cv_groups g JOIN __cv_rows r ON r.fold != g.held
 ),
 __cv_mg AS MATERIALIZED (SELECT g, count(*)::BIGINT AS mg FROM __cv_train GROUP BY g),
@@ -2008,7 +2015,7 @@ __cv_wroot AS MATERIALIZED (SELECT g, tree, sum(w) AS w_root FROM __cv_boot GROU
 __cv_tr AS (
     SELECT 'assign' AS tag, b.g, b.tree, 1::BIGINT AS node, 0::INTEGER AS depth, b.rid, b.w,
            NULL::STRUCT(col VARCHAR, kind VARCHAR, thr DOUBLE, cats_left VARCHAR[],
-                        unseen_left BOOLEAN, pred DOUBLE, cc MAP(VARCHAR, DOUBLE)) AS m
+                        cats_right VARCHAR[], unseen_left BOOLEAN, pred DOUBLE, cc MAP(VARCHAR, DOUBLE)) AS m
     FROM __cv_boot b
   UNION ALL
     (
@@ -2089,18 +2096,19 @@ __cv_tr AS (
                             CASE WHEN NOT isfinite((b.skey+b.nextkey)/2.0) OR (b.skey+b.nextkey)/2.0 >= b.nextkey
                                  THEN b.skey ELSE (b.skey+b.nextkey)/2.0 END END AS thr FROM best b),
      bdef AS (SELECT b.g,b.tree,b.node,b.depth,b.col,b.kind,b.thr, b.wn, b.wl,
-                     list(p.bucket) FILTER (b.kind='cat' AND (p.skey,p.bucket)<=(b.skey,b.bucket)) AS cats_left
+                     list(p.bucket) FILTER (b.kind='cat' AND (p.skey,p.bucket)<=(b.skey,b.bucket)) AS cats_left,
+                     list(p.bucket) FILTER (b.kind='cat' AND (p.skey,p.bucket)>(b.skey,b.bucket)) AS cats_right
               FROM bthr b LEFT JOIN pref p ON p.g=b.g AND p.tree=b.tree AND p.node=b.node AND p.col=b.col AND p.ord=b.ord
               GROUP BY b.g,b.tree,b.node,b.depth,b.col,b.kind,b.thr,b.wn,b.wl,b.skey,b.bucket)
      SELECT 'split', d.g, d.tree, d.node, d.depth, NULL::BIGINT, NULL::DOUBLE,
-            struct_pack(col:=d.col, kind:=d.kind, thr:=d.thr, cats_left:=d.cats_left,
+            struct_pack(col:=d.col, kind:=d.kind, thr:=d.thr, cats_left:=d.cats_left, cats_right:=d.cats_right,
                         unseen_left:=CASE WHEN d.kind='cat' THEN d.wl >= d.wn - d.wl END,
                         pred:=NULL::DOUBLE, cc:=NULL::MAP(VARCHAR,DOUBLE))
      FROM bdef d
      UNION ALL
      SELECT 'leaf', s.g, s.tree, s.node, s.depth, NULL::BIGINT, NULL::DOUBLE,
             struct_pack(col:=NULL::VARCHAR, kind:=NULL::VARCHAR, thr:=NULL::DOUBLE,
-                        cats_left:=NULL::VARCHAR[], unseen_left:=NULL::BOOLEAN,
+                        cats_left:=NULL::VARCHAR[], cats_right:=NULL::VARCHAR[], unseen_left:=NULL::BOOLEAN,
                         pred:=CASE WHEN family='regression' THEN s.pvec[2]/s.pvec[1]+(SELECT ybar FROM __cv_ybar) END,
                         cc:=CASE WHEN family='classification' THEN map_from_entries(list_transform(
                               (SELECT classes FROM __cv_classlist), lambda c,jj: struct_pack(key:=c, value:=s.pvec[jj]))) END)
@@ -2117,19 +2125,20 @@ __cv_tr AS (
 ),
 __cv_model AS MATERIALIZED (
     SELECT g, tree, node, tag='leaf' AS is_leaf, m.col AS split_feature, m.kind AS split_kind,
-           m.thr AS threshold, m.cats_left, m.unseen_left, m.pred AS prediction, m.cc AS class_counts
+           m.thr AS threshold, m.cats_left, m.cats_right, m.unseen_left, m.pred AS prediction, m.cc AS class_counts
     FROM __cv_tr WHERE tag IN ('split','leaf')
 ),
 __cv_int AS MATERIALIZED (SELECT * FROM __cv_model WHERE NOT is_leaf),
 __cv_leaf AS MATERIALIZED (SELECT g, tree, node, prediction, class_counts FROM __cv_model WHERE is_leaf),
 -- ===== score held-out rows through their group's trees =====
 __cv_sc AS (
-    SELECT gr.gidx, gr.g, t.tree, r.rid, 1::BIGINT AS node
+    SELECT gr.gidx, gr.g, t.tree, r.i AS rid, 1::BIGINT AS node
     FROM __cv_rows r JOIN __cv_groups gr ON gr.held = r.fold CROSS JOIN __cv_trees t
   UNION ALL
     SELECT s.gidx, s.g, s.tree, s.rid,
            s.node*2 + CASE WHEN i.split_kind='num' THEN CASE WHEN f.v<=i.threshold THEN 0 ELSE 1 END
                            ELSE CASE WHEN list_contains(i.cats_left,f.lv) THEN 0
+                                     WHEN list_contains(i.cats_right,f.lv) THEN 1
                                      WHEN i.unseen_left THEN 0 ELSE 1 END END
     FROM __cv_sc s JOIN __cv_int i ON i.g=s.g AND i.tree=s.tree AND i.node=s.node
     JOIN __cv_feat f ON f.rid=s.rid AND f.col=i.split_feature
@@ -2520,8 +2529,9 @@ ORDER BY o.importance DESC, o.feature;
 -- that is the far narrower spread of the ensemble's estimate of E[Y|x] and it
 -- badly UNDER-covers real observations. This macro implements the correct thing.
 --
--- Method. Let T_x = the trees that scored x. Drop every reference row down every
--- tree; n_t(L) = reference rows in leaf L of tree t. For a query row x with leaf
+-- Method. Let T_x = the trees that scored x and have reference responses in
+-- the reached leaf. Drop every reference row down every tree; n_t(L) = reference
+-- rows in leaf L of tree t. For a query row x with leaf
 -- L_t(x), reference row i has QRF weight
 --     w_i(x) = (1/T_x) * sum_t  1[ leaf_t(x_i) = L_t(x) ] / n_t(L_t(x)) ,
 -- the weights sum to 1 over i. The conditional CDF is F(y|x) = sum_i w_i 1[y_i<=y]
@@ -2609,13 +2619,18 @@ __rf_ref AS MATERIALIZED (
 __rf_leafn AS MATERIALIZED (
     SELECT tree, node, count(*) AS n_t FROM __rf_ref GROUP BY tree, node
 ),
--- Query leaf membership, and how many trees scored each query row (T_x).
+-- Query leaf membership; T_x counts only trees with reference responses in
+-- the reached leaf, so a subsampled reference still has total probability one.
 __rf_qwalk AS MATERIALIZED (
     SELECT w.rid, w.tree, w.node
     FROM __rf_walk(model, coalesce(newdata, tbl), 'rf_reg_quantile', 'regression', na_action, n_trees, false) w
     CROSS JOIN __rf_qchk ck WHERE ck.ok
 ),
-__rf_qtrees AS (SELECT rid, count(*) AS ntree FROM __rf_qwalk GROUP BY rid),
+__rf_qtrees AS (
+    SELECT q.rid, count(*) AS ntree
+    FROM __rf_qwalk q JOIN __rf_leafn ln ON ln.tree = q.tree AND ln.node = q.node
+    GROUP BY q.rid
+),
 -- Per (query row, reference response value): total weight before the 1/T_x scale
 -- is sum over trees & pooled rows of 1/n_t(leaf). Divide by T_x -> weights sum 1.
 __rf_dist AS (

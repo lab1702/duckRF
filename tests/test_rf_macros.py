@@ -2046,3 +2046,71 @@ class TestExtraTrees:
                     "n_trees:=1, splitter:='random', replace_sample:=false, sample_frac:=1.0, "
                     "min_samples_leaf:=120, seed:=1, max_depth:=8)")
         assert bool(df_run(con, "SELECT is_leaf FROM ml WHERE node=1").is_leaf[0])
+
+
+class TestEdgeCaseRegressions:
+    @pytest.mark.parametrize('family', ['regression', 'classification'])
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    def test_cv_ignores_discarded_rows(self, con, family, macro):
+        con.execute("CREATE OR REPLACE TABLE cv_clean AS SELECT i x, i*i y FROM range(20) t(i)")
+        con.execute("""CREATE OR REPLACE TABLE cv_nulls AS
+            SELECT NULL::BIGINT x, NULL::BIGINT y UNION ALL
+            SELECT x, y FROM cv_clean WHERE x < 10 UNION ALL
+            SELECT 999, NULL UNION ALL
+            SELECT x, y FROM cv_clean WHERE x >= 10 UNION ALL
+            SELECT NULL, 999""")
+        query = f"SELECT * FROM {macro}('{{}}','y','{family}',[1],k:=2,n_trees:=5)"
+        clean = df_run(con, query.format('cv_clean'))
+        dirty = df_run(con, query.format('cv_nulls'))
+        np.testing.assert_allclose(clean.cv_error, dirty.cv_error, atol=1e-12)
+
+    @pytest.mark.parametrize('family', ['regression', 'classification'])
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    def test_cv_routes_known_categorical_levels(self, con, family, macro):
+        con.execute("""CREATE OR REPLACE TABLE cv_cat AS
+            SELECT CASE WHEN i%4<3 THEN 'a' ELSE 'b' END x,
+                   CASE WHEN i%4<3 THEN 0 ELSE 10 END y FROM range(100) t(i)""")
+        result = df_run(con, f"SELECT * FROM {macro}('cv_cat','y','{family}',[1],k:=5,n_trees:=10)")
+        assert result.cv_error.iloc[0] == pytest.approx(0.0, abs=1e-12)
+
+    @pytest.mark.parametrize('macro', ['rf_reg_fit', 'rf_class_fit'])
+    def test_zero_mass_bootstrap_errors(self, con, macro):
+        con.execute('CREATE OR REPLACE TABLE zw AS SELECT * FROM (VALUES (0,0,1),(1,10,0)) t(x,y,w)')
+        with pytest.raises(DuckDBError, match='sampled tree has zero'):
+            df_run(con, f"SELECT * FROM {macro}('zw','y',weights_col:='w',n_trees:=10,seed:=42)")
+
+    @pytest.mark.parametrize('macro', ['rf_reg_fit', 'rf_class_fit'])
+    @pytest.mark.parametrize('weight', ['bad', 'NaN', 'Inf', '-Inf'])
+    def test_invalid_weights_error(self, con, macro, weight):
+        con.execute('CREATE OR REPLACE TABLE iw AS SELECT i x, i%2 y, ? w FROM range(10) t(i)', [weight])
+        with pytest.raises(DuckDBError, match='weights must be finite numeric'):
+            df_run(con, f"SELECT * FROM {macro}('iw','y',weights_col:='w',n_trees:=1)")
+
+    def test_zero_weight_rows_do_not_satisfy_sample_limits(self, con):
+        con.execute('''CREATE OR REPLACE TABLE zw AS SELECT * FROM
+            (VALUES (0,0,1),(1,10,1),(2,20,0),(3,30,0)) t(x,y,w)''')
+        model = df_run(con, """SELECT * FROM rf_reg_fit('zw','y',weights_col:='w',
+            n_trees:=1,replace_sample:=false,min_samples_split:=3)""")
+        assert len(model) == 1 and model.is_leaf.iloc[0]
+        assert model.n_rows.iloc[0] == 2
+        assert model.prediction.iloc[0] == pytest.approx(5.0)
+
+    def test_quantile_subsample_normalizes_contributing_trees(self, con):
+        con.execute('CREATE OR REPLACE TABLE qt AS SELECT i x, i*10 y FROM range(4) t(i)')
+        con.execute("CREATE OR REPLACE TABLE qm AS SELECT * FROM rf_reg_fit('qt','y',n_trees:=2,max_depth:=1,seed:=42)")
+        con.execute('CREATE OR REPLACE TABLE qr AS SELECT * FROM qt WHERE x=1')
+        con.execute('CREATE OR REPLACE TABLE qq AS SELECT 2::BIGINT x')
+        result = con.execute("SELECT quantile_pred FROM rf_reg_quantile('qm','qr','y',[0.1,0.5,0.9],newdata:='qq')").fetchone()[0]
+        assert result == {0.1: 10.0, 0.5: 10.0, 0.9: 10.0}
+        con.execute('DELETE FROM qr')
+        assert con.execute("SELECT quantile_pred FROM rf_reg_quantile('qm','qr','y',[0.5],newdata:='qq')").fetchone()[0] is None
+
+    @pytest.mark.parametrize('family', ['reg', 'class'])
+    def test_skip_tree_all_null_row_reaches_stump(self, con, family):
+        con.execute('CREATE OR REPLACE TABLE st AS SELECT i x, i%2 y FROM range(4) t(i)')
+        con.execute(f"CREATE OR REPLACE TABLE sm AS SELECT * FROM rf_{family}_fit('st','y',n_trees:=1,replace_sample:=false,min_samples_split:=10)")
+        con.execute('CREATE OR REPLACE TABLE sn AS SELECT NULL::BIGINT x')
+        column = 'prediction' if family == 'reg' else 'pred'
+        got = con.execute(f"SELECT {column} FROM rf_{family}_predict('sm','sn',na_action:='skip_tree')").fetchone()[0]
+        assert got == (0.5 if family == 'reg' else '0')
+        assert con.execute(f"SELECT {column} FROM rf_{family}_predict('sm','sn')").fetchone()[0] is None

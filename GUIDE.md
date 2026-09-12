@@ -76,7 +76,10 @@ the trees; `NULL` gives the sklearn defaults above. Tune it with
 **Sample weights.** `weights_col` names a column of non-negative per-row weights;
 a weight multiplies that row's bootstrap count, so an integer weight behaves like
 replicating the row that many times (sklearn's `sample_weight`). Weights apply to
-fitting only — `rf_*_predict` and `rf_*_evaluate` don't take them.
+fitting only — `rf_*_predict` and `rf_*_evaluate` don't take them. Supplied
+weights must be finite numeric values. Zero-weight observations do not count
+toward node sample limits. If a sampled tree has zero total weight, fitting
+errors; change the seed, increase `sample_frac`, or use positive weights.
 
 ```sql
 CREATE TABLE m AS SELECT * FROM rf_class_fit('surveys', 'label', weights_col := 'sampling_weight');
@@ -284,8 +287,10 @@ The idea: the conditional distribution of `Y | X = x` is the **weighted empirica
 distribution of the training responses that land in x's leaves** across the
 forest. A training row `i` gets weight `w_i(x) = (1/T) Σ_t 1[leaf_t(x_i) =
 leaf_t(x)] / n_t`, where `n_t` is the number of training rows in x's leaf of tree
-`t`; the weights sum to 1. The level-α prediction is the type-1 inverse CDF of
-that weighted pool — a real quantile of `Y`, not of the ensemble mean.
+`t`; only trees with reference responses in the reached leaf contribute to
+`T`, so the weights sum to 1 even with a subsampled reference. If no tree has
+reference responses for a query, its quantile map is `NULL`. The level-α prediction
+is the type-1 inverse CDF of that weighted pool — a real quantile of `Y`, not of the ensemble mean.
 
 `rf_reg_quantile(model, tbl, outcome, quantiles, newdata := NULL, ...)` takes the
 **reference sample** `tbl` (normally the training table) whose `outcome` responses

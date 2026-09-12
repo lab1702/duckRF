@@ -2332,3 +2332,31 @@ class TestSignedZeroSplits:
         query = f"SELECT * FROM {macro}('{{}}','y','{family}',[1],k:=2,n_trees:=3,min_samples_leaf:=2)"
         a, b = df_run(con, query.format('sz')), df_run(con, query.format('pz'))
         np.testing.assert_allclose(a.cv_error, b.cv_error, atol=1e-12, rtol=0)
+
+
+class TestWeightScaleAndFiniteResponses:
+    @pytest.mark.parametrize('family, criterion', [('class', 'gini'), ('class', 'entropy'), ('reg', 'mse')])
+    @pytest.mark.parametrize('scale', [1e-200, 1e200])
+    def test_common_weight_scale_preserves_split(self, con, family, criterion, scale):
+        con.execute('CREATE OR REPLACE TABLE ws AS SELECT i x, i//2 y, ? w FROM range(4) t(i)', [scale])
+        model = df_run(con, f"SELECT * FROM rf_{family}_fit('ws','y',weights_col:='w',n_trees:=1,replace_sample:=false,max_depth:=1,criterion:='{criterion}')")
+        assert len(model) == 3
+        assert model.loc[~model.is_leaf, 'threshold'].iloc[0] == 1.5
+        assert np.isfinite(model.impurity).all()
+
+    @pytest.mark.parametrize('value', ['NaN', 'Inf', '-Inf'])
+    def test_nonfinite_regression_responses_are_excluded(self, con, value):
+        con.execute('CREATE OR REPLACE TABLE ft AS SELECT i x, i::DOUBLE y FROM range(3) t(i)')
+        con.execute("CREATE OR REPLACE TABLE fm AS SELECT * FROM rf_reg_fit('ft','y',n_trees:=1,replace_sample:=false)")
+        con.execute(f"CREATE OR REPLACE TABLE fq AS SELECT x, CASE WHEN x=1 THEN '{value}'::DOUBLE ELSE y END y FROM ft")
+        metric = df_run(con, "SELECT * FROM rf_reg_evaluate('fm','fq','y')").iloc[0]
+        assert metric['n'] == 2 and metric.rmse == 0.0 and metric.r2 == 1.0
+        maps = con.execute("SELECT x,quantile_pred FROM rf_reg_quantile('fm','fq','y',[0.5,0.9]) ORDER BY x").fetchall()
+        assert maps == [(0, {0.5: 0.0, 0.9: 0.0}), (1, None), (2, {0.5: 2.0, 0.9: 2.0})]
+
+    def test_batch_null_bootstrap_reaches_fit_guard(self, con):
+        con.execute('CREATE OR REPLACE TABLE bs AS SELECT i x, i y FROM range(3) t(i)')
+        sql = con.execute("SELECT rf_batched_fit_sql('bs','y','regression',n_trees:=1,replace_sample:=NULL)").fetchone()[0]
+        assert 'replace_sample := NULL' in sql
+        with pytest.raises(DuckDBError, match='replace_sample'):
+            con.execute(sql).fetchall()

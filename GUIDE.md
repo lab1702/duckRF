@@ -356,7 +356,9 @@ SELECT * FROM rf_reg_evaluate('rmodel', 'penguins', 'body_mass_g');
 - `r2` = `1 − SSE/SST` with `SST = sum (y − mean(y))²` (sklearn's `r2_score`).
   For a constant target with at least two scored rows, it is 1 for perfect
   predictions and 0 otherwise; fewer than two scored rows yields `NULL`.
-  Permutation importance uses the same scoring convention.
+  Permutation importance uses the same scoring convention. Non-finite regression
+  outcomes are excluded from evaluation and quantile reference pools, as they
+  are from permutation scoring.
 
 **Classification** → `n, accuracy, log_loss, brier, auc`:
 
@@ -764,8 +766,9 @@ unlimited) and **does bind**: node ids are heap-numbered (so depth is capped at
 60 to stay inside `BIGINT`), and depth is the recursion's iteration count, so both
 time and peak memory grow linearly in it. A fully grown CART is ~`2·log2(n)` deep,
 so on a regression forest even a few hundred rows can hit the cap. `rf_summary`
-reports `depth_cap_hit` — `true` iff some tree was actually truncated (an impure
-leaf that only stopped at the cap). Pass `max_depth := NULL` to grow to purity
+reports `depth_cap_hit` — `true` when an impure leaf touches the depth cap.
+This indicates potential truncation; constant features or minimum sample limits
+may also prevent that leaf from splitting. Pass `max_depth := NULL` to grow to purity
 (hard cap 60):
 
 ```sql

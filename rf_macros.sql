@@ -260,10 +260,16 @@ CREATE OR REPLACE MACRO __rf_wt(vec, crit) AS (
 
 CREATE OR REPLACE MACRO __rf_q(vec, crit) AS (
     CASE crit
-      WHEN 'gini'    THEN list_sum(list_transform(vec, lambda x: x * x)) / list_sum(vec)
+      WHEN 'gini' THEN
+        CASE WHEN isfinite(list_sum(list_transform(vec, lambda x: x * x)))
+                   AND list_sum(list_transform(vec, lambda x: x * x)) >= 2.2250738585072014e-308
+             THEN list_sum(list_transform(vec, lambda x: x * x)) / list_sum(vec)
+             ELSE list_sum(list_transform(vec, lambda x: x * (x / list_sum(vec)))) END
       WHEN 'entropy' THEN list_sum(list_transform(vec, lambda x:
                               CASE WHEN x > 0 THEN x * log2(x / list_sum(vec)) ELSE 0.0 END))
-      ELSE vec[2] * vec[2] / vec[1]
+      ELSE CASE WHEN isfinite(vec[2] * vec[2]) AND vec[2] * vec[2] >= 2.2250738585072014e-308
+                THEN vec[2] * vec[2] / vec[1]
+                ELSE vec[2] * (vec[2] / vec[1]) END
     END
 );
 
@@ -1196,7 +1202,7 @@ CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100,
              || ', min_samples_leaf := ' || min_samples_leaf
              || ', min_impurity_decrease := ' || min_impurity_decrease
              || ', sample_frac := ' || sample_frac
-             || ', replace_sample := ' || CASE WHEN replace_sample THEN 'true' ELSE 'false' END
+             || ', replace_sample := ' || CASE WHEN replace_sample IS NULL THEN 'NULL' WHEN replace_sample THEN 'true' ELSE 'false' END
              || ', criterion := ' || __rf_quote((SELECT crit FROM __rf_bcfg))
              || ', seed := ' || seed
              || ', weights_col := ' || coalesce(__rf_quote(weights_col), 'NULL')
@@ -1672,7 +1678,7 @@ __rf_truth AS (
 __rf_rows AS (
     SELECT t.y, p.yhat
     FROM __rf_truth t JOIN __rf_pred p ON p.rid = t.rid
-    WHERE t.y IS NOT NULL AND p.yhat IS NOT NULL
+    WHERE isfinite(t.y) AND isfinite(p.yhat)
 ),
 __rf_ck AS (
     SELECT CASE WHEN (SELECT __rf_famchk(model, caller, 'regression')) IS NULL THEN false
@@ -1884,10 +1890,10 @@ FROM __rf_class_eval(model, tbl, outcome, 'rf_class_oob', 'null', NULL, true) e;
 -- ---------------------------------------------------------------------------
 -- rf_summary(model): one row describing how the forest was fit and what grew.
 -- The hyperparameters are read from the model metadata; the structure is a pure
--- aggregate over the node rows. depth_cap_hit is TRUE iff some tree was actually
--- truncated by max_depth -- i.e. there is a leaf at depth = max_depth whose
--- impurity is still > 0 (an impure leaf that only stopped because it hit the
--- cap). Without it a user has no way to know max_depth := 20 stunted the forest.
+-- aggregate over the node rows. depth_cap_hit means an impure leaf touches
+-- max_depth. It signals potential truncation: such a leaf may also have no
+-- valid split due to constant features or minimum sample limits. The model
+-- does not retain enough information to prove which stopping condition binds.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO rf_summary(model) AS TABLE
 SELECT any_value(family)                                   AS family,
@@ -2635,8 +2641,8 @@ ORDER BY o.importance DESC, o.feature;
 --
 -- A query row no tree scored (all-NULL features under 'null', every tree
 -- abstaining under 'skip_tree') has no walk rows and gets a NULL map, exactly
--- like rf_reg_predict's NULL contract. Reference rows with a NULL outcome are
--- dropped from the pool BEFORE n_t is counted, so the weights still normalise.
+-- like rf_reg_predict's NULL contract. Reference rows with a NULL or non-finite
+-- outcome are dropped BEFORE n_t is counted, so weights normalise.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO rf_reg_quantile(model, tbl, outcome, quantiles,
                                         newdata := NULL, na_action := 'null', n_trees := NULL) AS TABLE
@@ -2701,7 +2707,7 @@ __rf_refy AS MATERIALIZED (
 __rf_ref AS MATERIALIZED (
     SELECT w.tree, w.node, y.y
     FROM __rf_refwalk w JOIN __rf_refy y ON y.rid = w.rid
-    WHERE y.y IS NOT NULL
+    WHERE isfinite(y.y)
 ),
 -- n_t(leaf): reference rows in each (tree, leaf).
 __rf_leafn AS MATERIALIZED (

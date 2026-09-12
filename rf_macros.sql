@@ -277,6 +277,14 @@ CREATE OR REPLACE MACRO __rf_number(sval, typename) AS
     CASE WHEN typename = 'BOOLEAN' THEN CASE sval WHEN 'true' THEN 1.0 WHEN 'false' THEN 0.0 END
          ELSE TRY_CAST(sval AS DOUBLE) END;
 
+-- Preserve ordered ordinary sums; scale only when their intermediate sum overflows.
+-- A mean of finite inputs remains within their range even when their sum does not.
+CREATE OR REPLACE MACRO __rf_mean(vals) AS (
+    SELECT CASE WHEN isfinite(list_sum(v)) THEN list_sum(v) / list_count(v)
+                ELSE (list_sum(list_transform(v, lambda x: x / scale)) / list_count(v)) * scale END
+    FROM (SELECT vals AS v, list_max(list_transform(vals, lambda x: abs(x))) AS scale)
+);
+
 CREATE OR REPLACE MACRO __rf_r2(n, sse, sst) AS
     CASE WHEN n < 2 THEN NULL
          WHEN sst = 0 THEN CASE WHEN sse = 0 THEN 1.0 ELSE 0.0 END
@@ -1406,7 +1414,7 @@ __rf_cells AS MATERIALIZED (
 ),
 __rf_usable AS MATERIALIZED (
     SELECT * FROM __rf_cells
-    WHERE (kind = 'num' AND v IS NOT NULL) OR (kind = 'cat' AND lv IS NOT NULL)
+    WHERE (kind = 'num' AND isfinite(v)) OR (kind = 'cat' AND lv IS NOT NULL)
 ),
 __rf_rowids AS (SELECT row_number() OVER () AS rid FROM query_table(tbl)),
 __rf_full AS (
@@ -1566,7 +1574,7 @@ SELECT n.* EXCLUDE (__rf_rid__), p.prediction
 FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)) n
 CROSS JOIN (SELECT __rf_famchk(model, 'rf_reg_predict', 'regression') AS ok) g
 LEFT JOIN (
-    SELECT rid, avg(prediction) AS prediction
+    SELECT rid, __rf_mean(list(prediction ORDER BY tree)) AS prediction
     FROM __rf_walk(model, tbl, 'rf_reg_predict', 'regression', na_action, n_trees, false)
     GROUP BY rid
 ) p ON p.rid = n.__rf_rid__
@@ -1667,7 +1675,7 @@ __rf_types AS MATERIALIZED (
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 __rf_pred AS (
-    SELECT rid, avg(prediction) AS yhat
+    SELECT rid, __rf_mean(list(prediction ORDER BY tree)) AS yhat
     FROM __rf_walk(model, tbl, caller, 'regression', na_action, n_trees, oob)
     GROUP BY rid
 ),
@@ -1696,7 +1704,7 @@ __rf_ck AS (
                 ELSE true END AS ok
 ),
 __rf_agg AS (
-    SELECT count(*)::DOUBLE AS n, avg(y) AS ybar,
+    SELECT count(*)::DOUBLE AS n, __rf_mean(list(y)) AS ybar,
            sum((y - yhat) * (y - yhat)) AS sse, sum(abs(y - yhat)) AS sae
     FROM __rf_rows
 ),
@@ -1847,7 +1855,7 @@ SELECT n.* EXCLUDE (__rf_rid__), p.prediction
 FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)) n
 CROSS JOIN (SELECT __rf_famchk(model, 'rf_reg_oob_predict', 'regression') AS ok) g
 LEFT JOIN (
-    SELECT rid, avg(prediction) AS prediction
+    SELECT rid, __rf_mean(list(prediction ORDER BY tree)) AS prediction
     FROM __rf_walk(model, tbl, 'rf_reg_oob_predict', 'regression', 'null', NULL, true)
     GROUP BY rid
 ) p ON p.rid = n.__rf_rid__
@@ -2255,7 +2263,7 @@ __rf_cv_landed AS (
 ),
 -- forest prediction per (grid value, row)
 __rf_cv_regpred AS (
-    SELECT gidx, rid, avg(prediction) AS yhat FROM __rf_cv_landed GROUP BY gidx, rid
+    SELECT gidx, rid, __rf_mean(list(prediction ORDER BY tree)) AS yhat FROM __rf_cv_landed GROUP BY gidx, rid
 ),
 __rf_cv_clsprob AS (
     SELECT gidx, rid, cls, avg(cnt / wsum) AS p
@@ -2425,7 +2433,7 @@ __rf_cells AS MATERIALIZED (
 ),
 __rf_usable AS MATERIALIZED (
     SELECT * FROM __rf_cells
-    WHERE (kind = 'num' AND v IS NOT NULL) OR (kind = 'cat' AND lv IS NOT NULL)
+    WHERE (kind = 'num' AND isfinite(v)) OR (kind = 'cat' AND lv IS NOT NULL)
 ),
 -- Rows with every model feature usable (the 'null' na_action scored set).
 __rf_full AS (
@@ -2463,7 +2471,7 @@ __rf_yset AS MATERIALIZED (
     FROM __rf_scored sc JOIN __rf_truth tr ON tr.rid = sc.rid
 ),
 -- SST for R^2 (constant across jobs): ybar = mean y over the scored set.
-__rf_ybar AS (SELECT avg(yv) AS ybar FROM __rf_yset),
+__rf_ybar AS (SELECT __rf_mean(list(yv ORDER BY rid)) AS ybar FROM __rf_yset),
 __rf_sst AS (SELECT sum((yv - (SELECT ybar FROM __rf_ybar)) * (yv - (SELECT ybar FROM __rf_ybar))) AS sst
              FROM __rf_yset),
 -- Jobs: one per (feature, repeat). Baseline is added to the job set below.
@@ -2553,7 +2561,7 @@ __rf_landed AS (
 -- bit-identical. The sort keys are unique within each group, so the order is
 -- total and reproducible.
 __rf_regpred AS (
-    SELECT pf, rep, rid, list_sum(list(prediction ORDER BY tree)) / count(*) AS yhat
+    SELECT pf, rep, rid, __rf_mean(list(prediction ORDER BY tree)) AS yhat
     FROM __rf_landed GROUP BY pf, rep, rid
 ),
 __rf_clsprob AS (

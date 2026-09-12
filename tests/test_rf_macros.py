@@ -2399,3 +2399,40 @@ class TestNamespacesAndOverflow:
         con.execute('CREATE OR REPLACE TABLE oc AS SELECT i x, CASE WHEN i%4<2 THEN -1e308 ELSE 1e308 END y FROM range(20) t(i)')
         with pytest.raises(DuckDBError, match='regression moment overflow'):
             df_run(con, f"SELECT * FROM {macro}('oc','y','regression',[1],k:=2,n_trees:=2)")
+
+
+class TestFiniteScoring:
+    @pytest.mark.parametrize('value', [1e308, -1e308])
+    def test_large_finite_ensemble_mean(self, con, value):
+        con.execute('CREATE OR REPLACE TABLE huge AS SELECT i x, ? y FROM range(8) t(i)', [value])
+        con.execute("CREATE OR REPLACE TABLE hm AS SELECT * FROM rf_reg_fit('huge','y',n_trees:=12)")
+        for macro in ['rf_reg_predict', 'rf_reg_oob_predict']:
+            predictions = df_run(con, f"SELECT prediction FROM {macro}('hm','huge')").prediction
+            assert predictions.notna().all()
+            assert (predictions == value).all()
+        for macro in ['rf_reg_evaluate', 'rf_reg_oob']:
+            result = df_run(con, f"SELECT * FROM {macro}('hm','huge','y')").iloc[0]
+            assert result['n'] == 8 and result.rmse == 0 and result.mae == 0 and result.r2 == 1
+        for macro in ['rf_cv', 'rf_cv_depth']:
+            result = df_run(con, f"SELECT * FROM {macro}('huge','y','regression',[1],k:=2,n_trees:=2)")
+            assert result.iloc[0, 1] == 0.0
+        result = con.execute("SELECT * FROM rf_permutation_importance('hm','huge','y',n_repeats:=2)").fetchall()
+        assert result == [('x', 0.0, 0.0)]
+
+    @pytest.mark.parametrize('value', ['NaN', 'Inf', '-Inf'])
+    @pytest.mark.parametrize('family', ['reg', 'class'])
+    @pytest.mark.parametrize('action', ['null', 'skip_tree'])
+    def test_nonfinite_features_follow_missing_policy(self, con, value, family, action):
+        con.execute('CREATE OR REPLACE TABLE finite_train AS SELECT i x, 10*i y FROM range(3) t(i)')
+        con.execute(f"CREATE OR REPLACE TABLE finite_model AS SELECT * FROM rf_{family}_fit('finite_train','y',n_trees:=2,replace_sample:=false)")
+        for name, invalid in [('invalid_features', f"'{value}'::DOUBLE"), ('missing_features', 'NULL::DOUBLE')]:
+            con.execute(f'CREATE OR REPLACE TABLE {name} AS SELECT CASE WHEN x=1 THEN {invalid} ELSE x END x,y FROM finite_train')
+        query = f"SELECT * FROM rf_{family}_predict('finite_model','{{}}',na_action:='{action}')"
+        invalid = df_run(con, query.format('invalid_features'))
+        missing = df_run(con, query.format('missing_features'))
+        pd.testing.assert_frame_equal(invalid.iloc[:, 1:], missing.iloc[:, 1:])
+        assert invalid.iloc[1, -1] is None or pd.isna(invalid.iloc[1, -1])
+        query = f"SELECT * FROM rf_{family}_evaluate('finite_model','{{}}','y',na_action:='{action}')"
+        pd.testing.assert_frame_equal(df_run(con, query.format('invalid_features')), df_run(con, query.format('missing_features')))
+        query = "SELECT * FROM rf_permutation_importance('finite_model','{}','y',n_repeats:=2)"
+        pd.testing.assert_frame_equal(df_run(con, query.format('invalid_features')), df_run(con, query.format('missing_features')))

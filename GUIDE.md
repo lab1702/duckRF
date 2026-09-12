@@ -732,7 +732,12 @@ whose path never needs the missing feature (see [Predicting](#predicting)).
 
 ### NaN / Inf
 
-A `NaN` or `±Inf` in a numeric feature, or in a regression outcome, is **an
+At scoring time, non-finite numeric features are treated as missing and follow
+`na_action`: the default returns NULL for the row, while `skip_tree` uses only
+trees whose paths do not need that feature. Permutation importance excludes
+rows with these unusable features.
+
+At fitting time, a `NaN` or `±Inf` in a numeric feature, or in a regression outcome, is **an
 error** — it is not `NULL`, it would survive into the slot sums, and a `NaN` gain
 both passes a `>` filter and sorts first, silently hijacking the split search.
 Clean or drop those rows first.

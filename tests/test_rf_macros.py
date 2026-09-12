@@ -1827,7 +1827,7 @@ def _grow_et(df, feats, kinds, family, crit, seed, max_depth, mss=2, msl=1, mtry
                     payload = ("cat", None, sorted(lset), sorted(L for L in levels if L not in lset))
                 nl = int(lmask.sum()); nr = nrows - nl
                 if nl < msl or nr < msl: continue
-                lvec = slots(idx[lmask], center); rvec = [pvec[i] - lvec[i] for i in range(len(pvec))]
+                lvec = slots(idx[lmask], center); rvec = slots(idx[~lmask], center)
                 gain = _et_Q(lvec, crit) + _et_Q(rvec, crit) - qpar
                 if not math.isfinite(gain) or gain / w_root + EPS_ < 0.0: continue
                 cands.append((gain, f, payload, lmask))
@@ -2436,3 +2436,23 @@ class TestFiniteScoring:
         pd.testing.assert_frame_equal(df_run(con, query.format('invalid_features')), df_run(con, query.format('missing_features')))
         query = "SELECT * FROM rf_permutation_importance('finite_model','{}','y',n_repeats:=2)"
         pd.testing.assert_frame_equal(df_run(con, query.format('invalid_features')), df_run(con, query.format('missing_features')))
+
+
+class TestSplitMassAndScaledMetrics:
+    @pytest.mark.parametrize('splitter', ['best', 'random'])
+    @pytest.mark.parametrize('heavy_left', [True, False])
+    def test_small_positive_child_weight_survives(self, con, splitter, heavy_left):
+        con.execute('CREATE OR REPLACE TABLE unequal AS SELECT i x,100*i y,CASE WHEN i=? THEN 1e16 ELSE 1 END w FROM range(2) t(i)', [0 if heavy_left else 1])
+        con.execute(f"CREATE OR REPLACE TABLE um AS SELECT * FROM rf_reg_fit('unequal','y',weights_col:='w',n_trees:=1,replace_sample:=false,splitter:='{splitter}')")
+        assert con.execute('SELECT count(*) FROM um').fetchone()[0] == 3
+        assert con.execute("SELECT prediction FROM rf_reg_predict('um','unequal') ORDER BY x").fetchall() == [(0.0,), (100.0,)]
+
+    @pytest.mark.parametrize('magnitude', [1e154, 1e308])
+    @pytest.mark.parametrize('constant', [False, True])
+    def test_large_representable_metrics(self, con, magnitude, constant):
+        con.execute('CREATE OR REPLACE TABLE zero_train AS SELECT i x,0.0 y FROM range(4) t(i)')
+        con.execute("CREATE OR REPLACE TABLE zm AS SELECT * FROM rf_reg_fit('zero_train','y',n_trees:=2,replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE large_errors AS SELECT x,CASE WHEN ? OR x%2=0 THEN ? ELSE -? END y FROM zero_train', [constant, magnitude, magnitude])
+        result = df_run(con, "SELECT * FROM rf_reg_evaluate('zm','large_errors','y')").iloc[0]
+        assert result['n'] == 4 and result.rmse == magnitude and result.mae == magnitude and result.r2 == 0.0
+        assert con.execute("SELECT * FROM rf_permutation_importance('zm','large_errors','y',n_repeats:=2)").fetchall() == [('x', 0.0, 0.0)]

@@ -290,6 +290,35 @@ CREATE OR REPLACE MACRO __rf_r2(n, sse, sst) AS
          WHEN sst = 0 THEN CASE WHEN sse = 0 THEN 1.0 ELSE 0.0 END
          ELSE 1.0 - sse / sst END;
 
+-- Scale residuals and target deviations together before squaring. This keeps
+-- RMSE and SSE/SST representable when an unnormalized sum of squares overflows.
+CREATE OR REPLACE MACRO __rf_reg_stats(ys, ps) AS (
+    WITH __rf_metric_rows AS (
+        SELECT unnest(ys) AS y, unnest(ps) AS p, generate_subscripts(ys, 1) AS i
+    ),
+    __rf_metric_center AS (SELECT __rf_mean(ys) AS ybar),
+    __rf_metric_scale AS (
+        SELECT CASE WHEN isfinite(max(greatest(abs(y-p), abs(y-ybar))))
+                    THEN coalesce(nullif(max(greatest(abs(y-p), abs(y-ybar))), 0.0), 1.0)
+                    ELSE max(greatest(abs(y), abs(p))) END AS scale
+        FROM __rf_metric_rows, __rf_metric_center
+    ),
+    __rf_metric_norm AS (
+        SELECT i,
+               CASE WHEN isfinite(y-p) THEN (y-p)/scale ELSE y/scale-p/scale END AS e,
+               CASE WHEN isfinite(y-ybar) THEN (y-ybar)/scale ELSE y/scale-ybar/scale END AS d
+        FROM __rf_metric_rows, __rf_metric_center, __rf_metric_scale
+    ),
+    __rf_metric_sums AS (
+        SELECT count(*) AS n, list_sum(list(e*e ORDER BY i)) AS sse,
+               list_sum(list(d*d ORDER BY i)) AS sst, list_sum(list(abs(e) ORDER BY i)) AS sae
+        FROM __rf_metric_norm
+    )
+    SELECT struct_pack(n := n, rmse := sqrt(sse/n)*scale, mae := (sae/n)*scale,
+                       r2 := __rf_r2(n,sse,sst))
+    FROM __rf_metric_sums, __rf_metric_scale
+);
+
 -- SQL numeric equality identifies both signed zeros; bucket identity must too.
 CREATE OR REPLACE MACRO __rf_bucket(v) AS
     CAST(CASE WHEN v = 0 THEN 0.0 ELSE v END AS VARCHAR);
@@ -684,11 +713,12 @@ __rf_tr AS (
   UNION ALL
     (
      WITH cur AS (SELECT tree, node, depth, rid, w FROM __rf_tr WHERE tag = 'assign'),
-     -- A deterministic observed response is an exact local origin. Recompute it
+     -- The heaviest observation supplies a deterministic local origin, so a
+     -- dominant weight cannot erase variance around a low-weight origin. Recompute it
      -- from raw responses at each node: a remote outlier must not erase the
      -- small differences in a child after that outlier has split away.
      ncenter AS (
-        SELECT c.tree, c.node, first(y.yv ORDER BY c.rid) AS center
+        SELECT c.tree, c.node, first(y.yv ORDER BY c.w DESC, c.rid) AS center
         FROM cur c JOIN __rf_y y ON y.rid = c.rid
         WHERE family = 'regression' GROUP BY c.tree, c.node
      ),
@@ -794,7 +824,7 @@ __rf_tr AS (
      ),
      -- One cumulative-sum machine for both feature kinds: give every bucket a
      -- sort key, sum the slot vectors in key order, and every prefix boundary is
-     -- a candidate split (left = prefix, right = parent - prefix).
+     -- a candidate split (left = prefix, right = independently summed suffix).
      --   numeric     -> ord 0, key = the value itself (exact CART)
      --   categorical -> regression: key = mean(y) in the level; the prefix split
      --                  is optimal over all subsets without binding leaf-size
@@ -823,6 +853,8 @@ __rf_tr AS (
      cum AS (
         SELECT tree, node, col, ord, bucket, skey, slot,
                sum(s)     OVER pw AS cs,
+               sum(s) OVER (PARTITION BY tree, node, col, ord, slot ORDER BY skey, bucket
+                            ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS rs,
                sum(bn)    OVER pw AS cn,
                lead(skey) OVER pw AS nextkey
         FROM dense
@@ -832,7 +864,7 @@ __rf_tr AS (
      pref AS (
         SELECT tree, node, col, ord, bucket, skey,
                any_value(cn) AS nl, any_value(nextkey) AS nextkey,
-               list(cs ORDER BY slot) AS lvec
+               list(cs ORDER BY slot) AS lvec, list(rs ORDER BY slot) AS rvec
         FROM cum
         GROUP BY tree, node, col, ord, bucket, skey
      ),
@@ -842,7 +874,7 @@ __rf_tr AS (
      -- -- there ("subqueries in lambda expressions are not supported").
      cvec AS (
         SELECT p.tree, p.node, p.col, p.ord, p.bucket, p.skey, p.nextkey, p.nl, p.lvec,
-               list_transform(p.lvec, lambda x, j: s.pvec[j] - x) AS rvec,
+               p.rvec,
                s.depth, s.nrows, s.wn, s.pvec, s.imp, s.qpar, f.kind, wr.w_root
         FROM pref p
         JOIN sn s ON s.tree = p.tree AND s.node = p.node
@@ -951,11 +983,11 @@ __rf_tr AS (
         FROM cfr cf
         LEFT JOIN rthr rt ON rt.tree = cf.tree AND rt.node = cf.node AND rt.col = cf.col AND cf.kind = 'num'
      ),
-     -- Left slot sums (sparse) and left row-count / weight, per candidate feature.
+     -- Independent left/right slot sums and left row-count, per candidate feature.
      rlslot AS (
-        SELECT m.tree, m.node, m.col, u.slot, list_sum(list(m.w * u.u ORDER BY m.rid)) AS s
+        SELECT m.tree, m.node, m.col, u.slot, list_sum(list(m.w * u.u ORDER BY m.rid) FILTER (m.goleft)) AS s,
+               list_sum(list(m.w * u.u ORDER BY m.rid) FILTER (NOT m.goleft)) AS rs
         FROM rmemb m JOIN nu u ON u.tree = m.tree AND u.node = m.node AND u.rid = m.rid
-        WHERE m.goleft
         GROUP BY m.tree, m.node, m.col, u.slot
      ),
      rcnt AS (
@@ -965,18 +997,19 @@ __rf_tr AS (
      -- Densify the left slot vector against the full slot list (a slot absent
      -- from the left child must still hold its position, as in `nvec`).
      rlvec AS (
-        SELECT g.tree, g.node, g.col, list(coalesce(x.s, 0.0) ORDER BY g.slot) AS lvec
+        SELECT g.tree, g.node, g.col, list(coalesce(x.s, 0.0) ORDER BY g.slot) AS lvec,
+               list(coalesce(x.rs, 0.0) ORDER BY g.slot) AS rvec
         FROM (SELECT c.tree, c.node, c.col, k.slot
               FROM (SELECT DISTINCT tree, node, col FROM rmemb) c CROSS JOIN __rf_slots k) g
         LEFT JOIN rlslot x ON x.tree = g.tree AND x.node = g.node AND x.col = g.col AND x.slot = g.slot
         GROUP BY g.tree, g.node, g.col
      ),
-     -- rvec = parent - left, materialized as a column before __rf_q touches it
+     -- Independent right sums, materialized as a column before __rf_q touches them
      -- (no nested lambdas in a lambda body -- same reason as `cvec`).
      rcand AS (
         SELECT lv.tree, lv.node, lv.col, f.kind,
                s.depth, s.nrows, s.wn, s.pvec, s.imp, s.qpar, wr.w_root, lv.lvec, rc.nl,
-               list_transform(lv.lvec, lambda x, j: s.pvec[j] - x) AS rvec
+               lv.rvec
         FROM rlvec lv
         JOIN sn s ON s.tree = lv.tree AND s.node = lv.node
         JOIN rcnt rc ON rc.tree = lv.tree AND rc.node = lv.node AND rc.col = lv.col
@@ -1704,14 +1737,10 @@ __rf_ck AS (
                 ELSE true END AS ok
 ),
 __rf_agg AS (
-    SELECT count(*)::DOUBLE AS n, __rf_mean(list(y)) AS ybar,
-           sum((y - yhat) * (y - yhat)) AS sse, sum(abs(y - yhat)) AS sae
-    FROM __rf_rows
-),
-__rf_sst AS (SELECT sum((y - a.ybar) * (y - a.ybar)) AS sst FROM __rf_rows r, __rf_agg a)
-SELECT a.n::BIGINT AS n, sqrt(a.sse / a.n) AS rmse, a.sae / a.n AS mae,
-       __rf_r2(a.n, a.sse, s.sst) AS r2
-FROM __rf_agg a, __rf_sst s, __rf_ck ck
+    SELECT __rf_reg_stats(list(y), list(yhat)) AS stats FROM __rf_rows
+)
+SELECT a.stats.n AS n, a.stats.rmse AS rmse, a.stats.mae AS mae, a.stats.r2 AS r2
+FROM __rf_agg a, __rf_ck ck
 WHERE ck.ok;
 
 CREATE OR REPLACE MACRO __rf_class_eval(model, tbl, outcome, caller, na_action, n_trees, oob) AS TABLE
@@ -2116,7 +2145,7 @@ __rf_cv_tr AS (
     (
      WITH cur AS (SELECT g, tree, node, depth, rid, w FROM __rf_cv_tr WHERE tag = 'assign'),
      ncenter AS (
-        SELECT c.g, c.tree, c.node, first(y.yv ORDER BY c.rid) AS center
+        SELECT c.g, c.tree, c.node, first(y.yv ORDER BY c.w DESC, c.rid) AS center
         FROM cur c JOIN __rf_cv_y y ON y.rid=c.rid
         WHERE family='regression' GROUP BY c.g,c.tree,c.node
      ),
@@ -2186,14 +2215,17 @@ __rf_cv_tr AS (
      dense AS (SELECT c.g,c.tree,c.node,c.col,c.kind,c.ord,c.bucket,c.skey,c.bn,s.slot,c.bv[s.slot] AS s
                FROM cands c CROSS JOIN __rf_cv_slots s),
      cum AS (SELECT g,tree,node,col,kind,ord,bucket,skey,slot,
-                    sum(s) OVER pw AS cs, sum(bn) OVER pw AS cn, lead(skey) OVER pw AS nextkey
+                    sum(s) OVER pw AS cs,
+                    sum(s) OVER (PARTITION BY g,tree,node,col,ord,slot ORDER BY skey,bucket
+                                 ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS rs,
+                    sum(bn) OVER pw AS cn, lead(skey) OVER pw AS nextkey
              FROM dense
              WINDOW pw AS (PARTITION BY g,tree,node,col,ord,slot ORDER BY skey,bucket
                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)),
      pref AS (SELECT g,tree,node,col,ord,bucket,skey, any_value(kind) AS kind, any_value(cn) AS nl,
-                     any_value(nextkey) AS nextkey, list(cs ORDER BY slot) AS lvec
+                     any_value(nextkey) AS nextkey, list(cs ORDER BY slot) AS lvec, list(rs ORDER BY slot) AS rvec
               FROM cum GROUP BY g,tree,node,col,ord,bucket,skey),
-     cvec AS (SELECT p.*, list_transform(p.lvec, lambda x,jj: s.pvec[jj]-x) AS rvec,
+     cvec AS (SELECT p.*,
                      __rf_wt(p.lvec,(SELECT crit FROM __rf_cv_crit)) AS wl,
                      s.depth AS depth, s.pvec, s.qpar, s.wn AS wn, wr.w_root
               FROM pref p JOIN sn s ON s.g=p.g AND s.tree=p.tree AND s.node=p.node
@@ -2470,10 +2502,6 @@ __rf_yset AS MATERIALIZED (
     SELECT sc.i AS rid, tr.ys, tr.yv
     FROM __rf_scored sc JOIN __rf_truth tr ON tr.rid = sc.rid
 ),
--- SST for R^2 (constant across jobs): ybar = mean y over the scored set.
-__rf_ybar AS (SELECT __rf_mean(list(yv ORDER BY rid)) AS ybar FROM __rf_yset),
-__rf_sst AS (SELECT sum((yv - (SELECT ybar FROM __rf_ybar)) * (yv - (SELECT ybar FROM __rf_ybar))) AS sst
-             FROM __rf_yset),
 -- Jobs: one per (feature, repeat). Baseline is added to the job set below.
 __rf_jobs AS (
     SELECT f.col AS pf, r.rep::INTEGER AS rep
@@ -2582,9 +2610,7 @@ __rf_clspred AS (
 -- branch's predictions are all-NULL / empty and are filtered out here).
 __rf_regscore AS (
     SELECT p.pf, p.rep,
-           __rf_r2(count(*),
-                   list_sum(list((y.yv - p.yhat) * (y.yv - p.yhat) ORDER BY p.rid)),
-                   (SELECT sst FROM __rf_sst)) AS score
+           (__rf_reg_stats(list(y.yv ORDER BY p.rid), list(p.yhat ORDER BY p.rid))).r2 AS score
     FROM __rf_regpred p JOIN __rf_yset y ON y.rid = p.rid
     GROUP BY p.pf, p.rep
 ),

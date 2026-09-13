@@ -2504,3 +2504,29 @@ class TestScoringSnapshotsAndEntropy:
         imp = con.execute("SELECT __rf_imp([1e-200,1e124]::DOUBLE[],'entropy')").fetchone()[0]
         assert imp > 0
         assert imp == pytest.approx((324 * np.log2(10) * 1e-200) / 1e124, abs=5e-324)
+
+
+class TestEntropyGainOverflow:
+    @pytest.mark.parametrize('splitter', ['best', 'random'])
+    @pytest.mark.parametrize('minimum_gain', [0.0, 0.9])
+    def test_finite_large_weights_preserve_tree_and_pruning(self, con, splitter, minimum_gain):
+        models = []
+        for suffix, weight in [('unit', 1.0), ('large', 4e307)]:
+            con.execute('CREATE OR REPLACE TABLE entropy_scale AS SELECT i x,i y,? w FROM range(4) t(i)', [weight])
+            name = 'entropy_' + suffix
+            con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM rf_class_fit('entropy_scale','y',weights_col:='w',criterion:='entropy',n_trees:=1,replace_sample:=false,splitter:='{splitter}',min_impurity_decrease:={minimum_gain})")
+            model = df_run(con, f'SELECT * FROM {name} ORDER BY node')
+            assert np.isfinite(model.impurity).all()
+            assert np.isfinite(model.loc[~model.is_leaf, "imp_decrease"]).all()
+            assert model.loc[model.is_leaf, "imp_decrease"].isna().all()
+            models.append(model)
+        small, large = models
+        assert list(small.node) == list(large.node)
+        assert list(small.is_leaf) == list(large.is_leaf)
+        np.testing.assert_allclose(small.threshold, large.threshold, equal_nan=True)
+        np.testing.assert_allclose(small.imp_decrease, large.imp_decrease / 4e307, rtol=1e-14)
+        assert con.execute("SELECT * FROM rf_importance('entropy_unit')").fetchall() == con.execute("SELECT * FROM rf_importance('entropy_large')").fetchall()
+        assert con.execute("SELECT pred FROM rf_class_predict('entropy_unit','entropy_scale')").fetchall() == con.execute("SELECT pred FROM rf_class_predict('entropy_large','entropy_scale')").fetchall()
+        if minimum_gain == 0:
+            assert len(large) == 7
+            assert con.execute("SELECT accuracy FROM rf_class_evaluate('entropy_large','entropy_scale','y')").fetchone()[0] == 1.0

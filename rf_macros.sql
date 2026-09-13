@@ -343,6 +343,18 @@ CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
 );
 
 
+-- Entropy's weighted parent score can overflow even when the split gain fits.
+-- In that case subtract normalized impurities before restoring the node weight.
+CREATE OR REPLACE MACRO __rf_gain(lvec, rvec, pvec, crit, qpar) AS (
+    CASE WHEN crit = 'entropy' AND NOT isfinite(qpar)
+         THEN (__rf_imp(pvec, crit)
+               - (__rf_wt(lvec, crit) / __rf_wt(pvec, crit)) * __rf_imp(lvec, crit)
+               - (__rf_wt(rvec, crit) / __rf_wt(pvec, crit)) * __rf_imp(rvec, crit))
+              * __rf_wt(pvec, crit)
+         ELSE __rf_q(lvec, crit) + __rf_q(rvec, crit) - qpar END
+);
+
+
 -- Detect unrepresentable intermediate moments before they can become model rows.
 CREATE OR REPLACE MACRO __rf_moment_ok(vec, crit, caller) AS
     CASE WHEN crit = 'mse' AND
@@ -896,7 +908,7 @@ __rf_tr AS (
      -- "gain > 0" filter would truncate the tree and break CART equivalence.
      scored AS (
         SELECT c.*,
-               __rf_q(c.lvec, criterion) + __rf_q(c.rvec, criterion) - c.qpar AS gain,
+               __rf_gain(c.lvec, c.rvec, c.pvec, criterion, c.qpar) AS gain,
                __rf_wt(c.lvec, criterion) AS wl
         FROM cvec c
      ),
@@ -1023,7 +1035,7 @@ __rf_tr AS (
      ),
      rscored AS (
         SELECT c.*,
-               __rf_q(c.lvec, criterion) + __rf_q(c.rvec, criterion) - c.qpar AS gain,
+               __rf_gain(c.lvec, c.rvec, c.pvec, criterion, c.qpar) AS gain,
                __rf_wt(c.lvec, criterion) AS wl
         FROM rcand c
      ),

@@ -2700,3 +2700,32 @@ class TestLogLossClipping:
         want = log_loss(rows.y, probabilities, labels=labels)
         got = con.execute("SELECT log_loss FROM rf_class_oob('loss_model','loss_train','y')").fetchone()[0]
         assert got == pytest.approx(want, rel=1e-14)
+
+
+class TestVolatileBooleanTypeSnapshots:
+    @pytest.mark.parametrize('operation', [
+        'reg_predict', 'class_predict', 'reg_predict_trees', 'class_predict_trees',
+        'reg_evaluate', 'class_evaluate', 'reg_quantile_query',
+        'reg_quantile_reference', 'reg_quantile_default',
+    ])
+    def test_type_discovery_uses_the_scored_snapshot(self, con, operation):
+        family = 'class' if operation.startswith('class') else 'reg'
+        con.execute('CREATE OR REPLACE TABLE bool_train AS SELECT * FROM (VALUES (true,true),(false,false))t(x,y)')
+        con.execute(f"CREATE OR REPLACE TABLE bool_model AS SELECT * FROM rf_{family}_fit('bool_train','y',n_trees:=1,replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE bool_query AS SELECT true x')
+        con.execute('DROP VIEW IF EXISTS bool_volatile')
+        con.execute('DROP SEQUENCE IF EXISTS bool_seq')
+        con.execute('CREATE SEQUENCE bool_seq START 1')
+        con.execute("CREATE VIEW bool_volatile AS SELECT true x,true y WHERE nextval('bool_seq')%2=1")
+        if operation.startswith('reg_quantile'):
+            reference = 'bool_train' if operation.endswith('query') else 'bool_volatile'
+            newdata = ",newdata:='bool_volatile'" if operation.endswith('query') else ",newdata:='bool_query'" if operation.endswith('reference') else ''
+            rows = con.execute(f"SELECT quantile_pred FROM rf_reg_quantile('bool_model','{reference}','y',[0.5]{newdata})").fetchall()
+            assert rows == [({0.5: 1.0},)]
+        elif operation.endswith('evaluate'):
+            metrics = df_run(con, f"SELECT * FROM rf_{operation}('bool_model','bool_volatile','y')").iloc[0]
+            assert metrics['n'] == 1
+            assert metrics.accuracy == 1 if family == 'class' else metrics.rmse == 0
+        else:
+            column, expected = ('pred', 'true') if family == 'class' else ('prediction', 1.0)
+            assert con.execute(f"SELECT {column} FROM rf_{operation}('bool_model','bool_volatile')").fetchall() == [(expected,)]

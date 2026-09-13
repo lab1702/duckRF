@@ -1430,7 +1430,8 @@ __rf_types AS MATERIALIZED (
     SELECT colname, typename
     FROM (SELECT *
           FROM (SELECT 1 AS __rf_one)
-          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM (SELECT * EXCLUDE (__rf_rid__)
+                FROM query_table(coalesce(row_source, '__rf_walk_rows'))) LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 __rf_slong AS MATERIALIZED (
@@ -1760,7 +1761,7 @@ __rf_input_rows AS MATERIALIZED (
 __rf_types AS MATERIALIZED (
     SELECT colname, typename
     FROM (SELECT * FROM (SELECT 1 AS __rf_one)
-          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM (SELECT * EXCLUDE (__rf_rid__) FROM __rf_input_rows) LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 __rf_pred AS (
@@ -2765,8 +2766,13 @@ WITH
 __rf_reference_rows AS MATERIALIZED (
     SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
 ),
-__rf_query_rows AS MATERIALIZED (
+__rf_newdata_rows AS MATERIALIZED (
     SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(coalesce(newdata, tbl))
+),
+-- With no newdata, reference membership, outcomes, and output share one scan.
+__rf_query_rows AS MATERIALIZED (
+    SELECT * FROM query_table(CASE WHEN newdata IS NULL THEN '__rf_reference_rows'
+                                  ELSE '__rf_newdata_rows' END)
 ),
 -- Column types of the reference and query tables (same DESCRIBE-free discovery
 -- trick as __rf_walk), used only by the guards below.
@@ -2774,14 +2780,14 @@ __rf_reftypes AS MATERIALIZED (
     SELECT colname, typename
     FROM (SELECT *
           FROM (SELECT 1 AS __rf_one)
-          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM (SELECT * EXCLUDE (__rf_rid__) FROM __rf_reference_rows) LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 __rf_qrytypes AS MATERIALIZED (
     SELECT colname, typename
     FROM (SELECT *
           FROM (SELECT 1 AS __rf_one)
-          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(coalesce(newdata, tbl)) LIMIT 1) ON true)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM (SELECT * EXCLUDE (__rf_rid__) FROM __rf_query_rows) LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 -- Guards, house style: a CASE that error()s, referenced (WHERE ck.ok) by the

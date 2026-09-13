@@ -390,6 +390,8 @@ CREATE OR REPLACE MACRO __rf_fit(tbl, outcome, family, caller, n_trees, mtry, ma
                                  sample_frac, replace_sample, criterion, seed,
                                  weights_col, class_weight, tree_from, tree_to, splitter) AS TABLE
 WITH RECURSIVE
+-- Type discovery and values must observe the same rows, including volatile views.
+__rf_fit_input AS MATERIALIZED (SELECT * FROM query_table(tbl)),
 -- Column types. DESCRIBE does not bind query_table() inside a macro; this
 -- LEFT JOIN onto a constant row does, keeps column names AND order, and on an
 -- empty table returns one all-NULL typename row per column -- which is exactly
@@ -406,7 +408,7 @@ __rf_types AS MATERIALIZED (
            END AS kind
     FROM (SELECT *
           FROM (SELECT 1 AS __rf_one)
-          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM __rf_fit_input LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 -- ONE VARCHAR long-form for everything. UNPIVOT needs a single common type and
@@ -419,7 +421,7 @@ __rf_types AS MATERIALIZED (
 __rf_slong AS MATERIALIZED (
     SELECT __rf_rid__ AS rid, name AS col, value AS sval
     FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
-                   FROM query_table(tbl))
+                   FROM __rf_fit_input)
           ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value)
 ),
 __rf_present AS (SELECT DISTINCT col FROM __rf_slong),
@@ -2064,6 +2066,8 @@ FROM query_table(model);
 CREATE OR REPLACE MACRO __rf_cv(tbl, outcome, family, grid, sweep, k, n_trees, mtry_fixed,
                                 max_depth_fixed, min_samples_leaf, sample_frac, seed) AS TABLE
 WITH RECURSIVE
+-- Type discovery and values must observe the same rows, including volatile views.
+__rf_cv_input AS MATERIALIZED (SELECT * FROM query_table(tbl)),
 __rf_cv_types AS MATERIALIZED (
     SELECT colname, typename,
            CASE WHEN typename IN ('BOOLEAN','TINYINT','SMALLINT','INTEGER','BIGINT','HUGEINT',
@@ -2071,12 +2075,12 @@ __rf_cv_types AS MATERIALIZED (
                      OR starts_with(typename, 'DECIMAL') THEN 'num'
                 WHEN typename = 'VARCHAR' OR starts_with(typename, 'ENUM') THEN 'cat' END AS kind
     FROM (SELECT * FROM (SELECT 1 AS __rf_one)
-          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM __rf_cv_input LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 __rf_cv_slong AS MATERIALIZED (
     SELECT __rf_rid__ AS rid, name AS col, value AS sval
-    FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl))
+    FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR) FROM __rf_cv_input)
           ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value)
 ),
 __rf_cv_featcols AS MATERIALIZED (
@@ -2471,6 +2475,8 @@ FROM __rf_cv(tbl, outcome, family, depth_grid, 'depth', k, n_trees, mtry, NULL,
 CREATE OR REPLACE MACRO rf_permutation_importance(model, tbl, outcome,
                                                   n_repeats := 5, seed := 42) AS TABLE
 WITH RECURSIVE
+-- Type discovery and values must observe the same rows, including volatile views.
+__rf_perm_input AS MATERIALIZED (SELECT * FROM query_table(tbl)),
 -- Forest metadata, constant on every model row (any_value idiom, as __rf_walk).
 __rf_meta AS MATERIALIZED (
     SELECT any_value(family)        AS family,
@@ -2490,14 +2496,14 @@ __rf_types AS MATERIALIZED (
     SELECT colname, typename
     FROM (SELECT *
           FROM (SELECT 1 AS __rf_one)
-          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM query_table(tbl) LIMIT 1) ON true)
+          LEFT JOIN (SELECT typeof(COLUMNS('^(.*)$')) AS '\1' FROM __rf_perm_input LIMIT 1) ON true)
          UNPIVOT INCLUDE NULLS (typename FOR colname IN (COLUMNS(* EXCLUDE (__rf_one))))
 ),
 -- ONE VARCHAR long-form of the whole scoring table (features AND the outcome).
 __rf_slong AS MATERIALIZED (
     SELECT __rf_rid__ AS rid, name AS col, value AS sval
     FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
-                   FROM query_table(tbl))
+                   FROM __rf_perm_input)
           ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value)
 ),
 -- Guards. As elsewhere, a guard only fires if its boolean is REFERENCED, so the

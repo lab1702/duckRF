@@ -2729,3 +2729,32 @@ class TestVolatileBooleanTypeSnapshots:
         else:
             column, expected = ('pred', 'true') if family == 'class' else ('prediction', 1.0)
             assert con.execute(f"SELECT {column} FROM rf_{operation}('bool_model','bool_volatile')").fetchall() == [(expected,)]
+
+
+class TestTrainingAndImportanceSnapshots:
+    @pytest.mark.parametrize('operation', [
+        'rf_reg_fit', 'rf_class_fit', 'rf_cv', 'rf_cv_depth',
+        'rf_permutation_importance',
+    ])
+    def test_volatile_source_is_read_once(self, con, operation):
+        con.execute('CREATE OR REPLACE TABLE snapshot_train AS SELECT i%2=0 x,i%2=0 y FROM range(12)t(i)')
+        con.execute("CREATE OR REPLACE TABLE snapshot_model AS SELECT * FROM rf_reg_fit('snapshot_train','y',n_trees:=1,replace_sample:=false)")
+        con.execute('DROP VIEW IF EXISTS snapshot_view')
+        con.execute('DROP SEQUENCE IF EXISTS snapshot_seq')
+        con.execute('CREATE SEQUENCE snapshot_seq START 1')
+        con.execute("CREATE VIEW snapshot_view AS SELECT * FROM snapshot_train WHERE (SELECT nextval('snapshot_seq')%2=1)")
+        if operation.endswith('_fit'):
+            args = "'y',n_trees:=1,replace_sample:=false"
+            stable = f"SELECT * FROM {operation}('snapshot_train',{args}) ORDER BY tree,node"
+            volatile = f"SELECT * FROM {operation}('snapshot_view',{args}) ORDER BY tree,node"
+        elif operation.startswith('rf_cv'):
+            args = "'y','regression',[1],k:=2,n_trees:=1"
+            stable = f"SELECT * FROM {operation}('snapshot_train',{args})"
+            volatile = f"SELECT * FROM {operation}('snapshot_view',{args})"
+        else:
+            stable = "SELECT * FROM rf_permutation_importance('snapshot_model','snapshot_train','y',n_repeats:=1)"
+            volatile = "SELECT * FROM rf_permutation_importance('snapshot_model','snapshot_view','y',n_repeats:=1)"
+        expected = con.execute(stable).fetchall()
+        assert expected
+        assert con.execute(volatile).fetchall() == expected
+        assert con.execute("SELECT currval('snapshot_seq')").fetchone()[0] == 1

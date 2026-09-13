@@ -681,7 +681,8 @@ __rf_feat AS MATERIALIZED (
 -- forest size (metadata, RNG, OOB replay all use it), never the batch count.
 __rf_trees AS (SELECT unnest(range(coalesce(tree_from, 1),
                                    coalesce(tree_to, n_trees) + 1))::INTEGER AS tree),
-__rf_m AS (SELECT greatest(1, ceil(sample_frac * (SELECT n FROM __rf_n)))::BIGINT AS m),
+-- Use the persisted DOUBLE representation so OOB replay rounds the same bag size.
+__rf_m AS (SELECT greatest(1, ceil(sample_frac::DOUBLE * (SELECT n FROM __rf_n)))::BIGINT AS m),
 __rf_boot AS MATERIALIZED (
     SELECT t.tree, d.rid, count(*)::DOUBLE * any_value(rw.rw) AS w
     FROM __rf_trees t
@@ -2188,7 +2189,7 @@ __rf_cv_boot AS MATERIALIZED (
         CROSS JOIN LATERAL (
             SELECT (md5_number(seed || ':cv:' || g.g || ':' || t.tree || ':' || kk.kk)
                     % (SELECT mg FROM __rf_cv_mg m WHERE m.g = g.g)::UHUGEINT)::BIGINT + 1 AS j
-            FROM range(1, greatest(1, ceil(sample_frac * (SELECT mg FROM __rf_cv_mg m WHERE m.g = g.g)))::BIGINT + 1) kk(kk)
+            FROM range(1, greatest(1, ceil(sample_frac::DOUBLE * (SELECT mg FROM __rf_cv_mg m WHERE m.g = g.g)))::BIGINT + 1) kk(kk)
         ) d
     ) b
     JOIN __rf_cv_train tr ON tr.g = b.g AND tr.j = b.j

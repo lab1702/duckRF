@@ -2578,3 +2578,30 @@ class TestRegressionMomentUnderflow:
         con.execute('CREATE OR REPLACE TABLE underflow_cv AS SELECT i x,CASE WHEN i%4<2 THEN 0.0 ELSE 1e-170 END y FROM range(20)t(i)')
         with pytest.raises(DuckDBError, match='regression moment underflow; rescale'):
             con.execute(f"SELECT * FROM {macro}('underflow_cv','y','regression',[1],k:=2,n_trees:=2)").fetchall()
+
+
+class TestSampleFractionReplay:
+    @pytest.mark.parametrize('family', ['reg', 'class'])
+    @pytest.mark.parametrize('replace', [False, True])
+    @pytest.mark.parametrize('fraction', ['0.07', '0.300000000000000001'])
+    def test_decimal_fraction_uses_persisted_sample_size(self, con, family, replace, fraction):
+        con.execute('CREATE OR REPLACE TABLE fraction_train AS SELECT i x,i%2 y FROM range(100)t(i)')
+        for model, expression in [('fraction_decimal', fraction), ('fraction_double', f'{fraction}::DOUBLE')]:
+            con.execute(f"CREATE OR REPLACE TABLE {model} AS SELECT * FROM rf_{family}_fit('fraction_train','y',n_trees:=1,sample_frac:={expression},replace_sample:={str(replace).lower()})")
+        assert con.execute('SELECT * FROM fraction_decimal ORDER BY tree,node').fetchall() == con.execute('SELECT * FROM fraction_double ORDER BY tree,node').fetchall()
+        size = int(np.ceil(float(fraction)*100))
+        assert con.execute('SELECT w_node FROM fraction_decimal WHERE node=1').fetchone()[0] == size
+        if replace:
+            bag = _bags_replace(42, 1, 100, size)[0]
+        else:
+            bag = set(sorted(range(1, 101), key=lambda i: _md5num(f'42:1:{i}'))[:size])
+        pred = 'prediction' if family == 'reg' else 'pred'
+        rows = con.execute(f"SELECT x,{pred} IS NULL FROM rf_{family}_oob_predict('fraction_decimal','fraction_train')").fetchall()
+        assert len(rows) == 100
+        assert {x+1 for x, excluded in rows if excluded} == bag
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    def test_cv_fraction_literal_type_does_not_change_sampling(self, con, macro):
+        con.execute('CREATE OR REPLACE TABLE fraction_cv AS SELECT i x,i%7 y FROM range(200)t(i)')
+        scores = [con.execute(f"SELECT * FROM {macro}('fraction_cv','y','regression',[1],k:=2,n_trees:=1,sample_frac:={expression})").fetchall() for expression in ['0.07', '0.07::DOUBLE']]
+        assert scores[0] == scores[1]

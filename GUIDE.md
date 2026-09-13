@@ -83,7 +83,9 @@ errors; change the seed, increase `sample_frac`, or use positive weights.
 Regression fitting and CV also reject overflowing intermediate moments and
 nonzero moment products that underflow to zero. Rescale the outcomes or sample
 weights when their combined magnitude is outside DOUBLE arithmetic, even if
-the individual input values are finite.
+the individual input values are finite. Classification fitting rejects subnormal
+node weights (below `2.2250738585072014e-308`); rescale sample weights to preserve
+split-gain precision.
 
 ```sql
 CREATE TABLE m AS SELECT * FROM rf_class_fit('surveys', 'label', weights_col := 'sampling_weight');

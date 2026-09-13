@@ -2605,3 +2605,58 @@ class TestSampleFractionReplay:
         con.execute('CREATE OR REPLACE TABLE fraction_cv AS SELECT i x,i%7 y FROM range(200)t(i)')
         scores = [con.execute(f"SELECT * FROM {macro}('fraction_cv','y','regression',[1],k:=2,n_trees:=1,sample_frac:={expression})").fetchall() for expression in ['0.07', '0.07::DOUBLE']]
         assert scores[0] == scores[1]
+
+
+class TestQuantileBoundaryPrecision:
+    @pytest.mark.parametrize('size', [35, 55, 70, 95])
+    @pytest.mark.parametrize('trees', [1, 3])
+    def test_equal_weight_boundaries_match_empirical_cdf(self, con, size, trees):
+        con.execute('CREATE OR REPLACE TABLE boundary_ref AS SELECT 0 x,CASE WHEN i<? THEN i ELSE i+1000 END y FROM range(?)t(i)', [size//5, size])
+        con.execute(f"CREATE OR REPLACE TABLE boundary_model AS SELECT * FROM rf_reg_fit('boundary_ref','y',n_trees:={trees},replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE boundary_query AS SELECT 0 x')
+        levels = [0.2, np.nextafter(0.2, 1.0), 0.4, 0.6, 0.8]
+        got = con.execute(f"SELECT quantile_pred FROM rf_reg_quantile('boundary_model','boundary_ref','y',{_lv(levels)},newdata:='boundary_query')").fetchone()[0]
+        ys = np.array([i if i<size//5 else i+1000 for i in range(size)])
+        # Integer ranks divided once by the sample count are an independent
+        # empirical CDF, including the level immediately above a boundary.
+        want = _wquantile_type1(ys, np.ones(size), levels)
+        assert got == want
+
+    def test_unequal_leaf_pools_match_rational_weights(self, con):
+        from fractions import Fraction
+        con.execute('CREATE OR REPLACE TABLE rational_ref AS SELECT i x,(i%7)*10+i y FROM range(31)t(i)')
+        con.execute("CREATE OR REPLACE TABLE rational_model AS SELECT * FROM rf_reg_fit('rational_ref','y',n_trees:=3,min_samples_leaf:=4)")
+        con.execute('CREATE OR REPLACE TABLE rational_query AS SELECT * FROM (VALUES (3),(9),(14))t(x)')
+        pools = {}
+        for rid, tree, node in con.execute("SELECT rid,tree,node FROM __rf_walk('rational_model','rational_ref','test','regression','null',NULL,false)").fetchall():
+            i = rid-1
+            pools.setdefault((tree, node), []).append((i%7)*10+i)
+        reached = {}
+        for rid, tree, node in con.execute("SELECT rid,tree,node FROM __rf_walk('rational_model','rational_query','test','regression','null',NULL,false)").fetchall():
+            reached.setdefault(rid, []).append(pools[tree, node])
+        levels = [0.2, 0.5, 0.8]
+        got = [row[0] for row in con.execute(f"SELECT quantile_pred FROM rf_reg_quantile('rational_model','rational_ref','y',{_lv(levels)},newdata:='rational_query')").fetchall()]
+        for rid, result in enumerate(got, 1):
+            mass = {}
+            for pool in reached[rid]:
+                for y in pool:
+                    mass[y] = mass.get(y, Fraction(0)) + Fraction(1, len(pool)*len(reached[rid]))
+            cumulative = Fraction(0)
+            want = {}
+            for y, weight in sorted(mass.items()):
+                cumulative += weight
+                for level in levels:
+                    if level not in want and float(cumulative) >= level:
+                        want[level] = y
+            assert result == want
+
+
+class TestClassificationSubnormalWeights:
+    @pytest.mark.parametrize('criterion', ['gini', 'entropy'])
+    @pytest.mark.parametrize('splitter', ['best', 'random'])
+    def test_subnormal_node_weight_requires_rescaling(self, con, criterion, splitter):
+        con.execute('CREATE OR REPLACE TABLE class_tiny AS SELECT i x,i%2 y,5e-324 w FROM range(4)t(i)')
+        with pytest.raises(DuckDBError, match='classification node weight is subnormal; rescale'):
+            con.execute(f"SELECT * FROM rf_class_fit('class_tiny','y',n_trees:=1,replace_sample:=false,weights_col:='w',min_impurity_decrease:=0.1,criterion:='{criterion}',splitter:='{splitter}')").fetchall()
+        con.execute('UPDATE class_tiny SET w=1.0')
+        assert con.execute(f"SELECT count(*) FROM rf_class_fit('class_tiny','y',n_trees:=1,replace_sample:=false,weights_col:='w',min_impurity_decrease:=0.1,criterion:='{criterion}',splitter:='{splitter}')").fetchone()[0] > 1

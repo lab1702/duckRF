@@ -380,6 +380,9 @@ CREATE OR REPLACE MACRO __rf_moment_ok(vec, crit, caller) AS
                    (len(list_filter(vec, lambda x: NOT isfinite(x))) > 0
                     OR NOT isfinite(__rf_imp(vec, crit)))
          THEN error(caller || ': regression moment overflow; rescale outcomes or sample weights')
+         WHEN crit != 'mse' AND __rf_wt(vec, crit) > 0
+              AND __rf_wt(vec, crit) < 2.2250738585072014e-308
+         THEN error(caller || ': classification node weight is subnormal; rescale sample weights')
          ELSE true END;
 
 CREATE OR REPLACE MACRO __rf_fit(tbl, outcome, family, caller, n_trees, mtry, max_depth,
@@ -2843,27 +2846,25 @@ __rf_qtrees AS (
     FROM __rf_qwalk q JOIN __rf_leafn ln ON ln.tree = q.tree AND ln.node = q.node
     GROUP BY q.rid
 ),
--- Per (query row, reference response value): total weight before the 1/T_x scale
--- is sum over trees & pooled rows of 1/n_t(leaf). Divide by T_x -> weights sum 1.
+-- Accumulate probability masses on a 2^120 integer scale before converting
+-- once to DOUBLE. Each reference/tree pair loses less than 2^-120 of mass,
+-- avoiding the boundary drift from accumulating rounded DOUBLE reciprocals.
+-- Divide the budget by T_x first so all masses together fit inside HUGEINT.
 __rf_dist AS (
-    SELECT c.qrid, c.y, c.wsum / qt.ntree AS w
-    FROM (
-        SELECT q.rid AS qrid, r.y AS y, fsum(1.0 / ln.n_t) AS wsum
-        FROM __rf_qwalk q
-        JOIN __rf_leafn ln ON ln.tree = q.tree AND ln.node = q.node
-        JOIN __rf_ref    r ON r.tree = q.tree AND r.node = q.node
-        GROUP BY q.rid, r.y
-    ) c
-    JOIN __rf_qtrees qt ON qt.rid = c.qrid
+    SELECT q.rid AS qrid, r.y,
+           sum(((1::HUGEINT << 120) // qt.ntree) // ln.n_t) AS w
+    FROM __rf_qwalk q
+    JOIN __rf_qtrees qt ON qt.rid = q.rid
+    JOIN __rf_leafn ln ON ln.tree = q.tree AND ln.node = q.node
+    JOIN __rf_ref r ON r.tree = q.tree AND r.node = q.node
+    GROUP BY q.rid, r.y
 ),
--- Cumulative weight over the pooled responses sorted ascending (deterministic:
--- the pooled y are distinct within a query row). Compensated sums avoid
--- skipped type-1 boundaries, and normalize by the realized total so the final
--- CDF value is exactly one even after rounding the per-tree weights.
+-- Normalize the integer cumulative mass by its realized total. The final CDF
+-- is one, while empirical boundaries such as 7/35 round directly to 0.2.
 __rf_cum AS (
     SELECT qrid, y,
-           fsum(w) OVER (PARTITION BY qrid ORDER BY y ROWS UNBOUNDED PRECEDING)
-             / fsum(w) OVER (PARTITION BY qrid) AS cw
+           sum(w) OVER (PARTITION BY qrid ORDER BY y ROWS UNBOUNDED PRECEDING)
+             / sum(w) OVER (PARTITION BY qrid) AS cw
     FROM __rf_dist
 ),
 -- Type-1 inverse CDF: smallest response whose cumulative weight first reaches the

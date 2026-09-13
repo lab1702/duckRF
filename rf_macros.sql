@@ -1741,8 +1741,8 @@ ORDER BY rid, tree;
 -- Classification (__rf_class_eval) -> n, accuracy, log_loss, brier, auc
 --   probs is the DENSE forest distribution; pred is its argmax (ties -> smallest
 --   label). accuracy = mean[pred = y].
---   log_loss = -mean ln(clip(p_y, 1e-15, 1-1e-15))  -- sklearn clips to the
---     float64 machine epsilon and does NOT renormalize (matched to 1e-9).
+--   log_loss = -mean ln(clip(p_y, eps, 1-eps)), eps = float64 machine epsilon
+--     (2.220446049250313e-16), matching sklearn without renormalization.
 --   brier = mean sum_k (1[y=k] - p_k)^2, HALVED for binary (sklearn's
 --     scale_by_half='auto' halves when < 3 classes, i.e. binary).
 --   auc: binary only, else NULL. Positive class = the lexicographically GREATER
@@ -1865,7 +1865,7 @@ __rf_auc AS (
 __rf_metrics AS (
     SELECT count(*)::BIGINT AS n,
            avg((pred = y)::INT) AS accuracy,
-           -avg(ln(least(greatest(p_true, 1e-15), 1.0 - 1e-15))) AS log_loss,
+           -avg(ln(least(greatest(p_true, 2.220446049250313e-16), 1.0 - 2.220446049250313e-16))) AS log_loss,
            avg(brier_row) * CASE WHEN (SELECT nclasses FROM __rf_pos) < 3 THEN 0.5 ELSE 1.0 END AS brier
     FROM __rf_perrow
 )

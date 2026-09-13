@@ -377,8 +377,8 @@ SELECT * FROM rf_class_evaluate('cmodel', 'penguins', 'species');
 ```
 
 - `accuracy` = `mean[pred = y]`.
-- `log_loss` = `−mean ln(clip(p_y, 1e-15, 1−1e-15))` — sklearn clips to the
-  float64 machine epsilon and does not renormalize.
+- `log_loss` = `−mean ln(clip(p_y, ε, 1−ε))`, with float64 machine epsilon
+  `ε = 2.220446049250313e-16`, matching sklearn without renormalization.
 - `brier` = `mean Σ_k (1[y=k] − p_k)²`, **halved for binary** (sklearn's
   `scale_by_half='auto'` halves when there are fewer than 3 classes).
 - `auc` is **binary only** (else `NULL`); the positive class is the

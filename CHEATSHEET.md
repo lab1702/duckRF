@@ -131,7 +131,7 @@ rf_reg_evaluate(model, tbl, outcome, na_action := 'null', n_trees := NULL)
 ```
 
 `auc` positive class = lexicographically **greater** label; `log_loss` clipped
-to `[1e-15, 1-1e-15]`.
+to `[ε, 1-ε]`, where `ε = 2.220446049250313e-16` (float64 machine epsilon).
 
 ## Out-of-bag  (tbl MUST be the exact training table — validated, errors on mismatch)
 

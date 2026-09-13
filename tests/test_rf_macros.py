@@ -2673,3 +2673,30 @@ class TestQuantileIntegerConversion:
         got = con.execute("SELECT quantile_pred FROM rf_reg_quantile('ratio_model','ratio_ref','y',?::DOUBLE[],newdata:='ratio_query')", [[float(q) for q in levels]]).fetchone()[0]
         ys = np.array(list(range(size-1)) + [1000000])
         assert got == _wquantile_type1(ys, np.ones(size), levels)
+
+
+class TestLogLossClipping:
+    @pytest.mark.parametrize('classes', [2, 3])
+    @pytest.mark.parametrize('wrong', [False, True])
+    def test_confident_predictions_match_sklearn(self, con, classes, wrong):
+        con.execute('CREATE OR REPLACE TABLE loss_train AS SELECT i x,i::VARCHAR y FROM range(?)t(i)', [classes])
+        con.execute("CREATE OR REPLACE TABLE loss_model AS SELECT * FROM rf_class_fit('loss_train','y',n_trees:=1,replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE loss_query AS SELECT i x,((i+?)%?)::VARCHAR y FROM range(?)t(i)', [int(wrong), classes, classes])
+        rows = df_run(con, "SELECT * FROM rf_class_predict('loss_model','loss_query')")
+        labels = [str(i) for i in range(classes)]
+        probabilities = np.array([[p[label] for label in labels] for p in rows.probs])
+        want = log_loss(rows.y, probabilities, labels=labels)
+        got = con.execute("SELECT log_loss FROM rf_class_evaluate('loss_model','loss_query','y')").fetchone()[0]
+        assert got == pytest.approx(want, rel=1e-14, abs=1e-30)
+
+    @pytest.mark.parametrize('classes', [2, 3])
+    def test_confidently_wrong_oob_predictions_match_sklearn(self, con, classes):
+        con.execute('CREATE OR REPLACE TABLE loss_train AS SELECT i x,i::VARCHAR y FROM range(?)t(i)', [classes])
+        con.execute("CREATE OR REPLACE TABLE loss_model AS SELECT * FROM rf_class_fit('loss_train','y',n_trees:=1,sample_frac:=0.1,replace_sample:=false)")
+        rows = df_run(con, "SELECT * FROM rf_class_oob_predict('loss_model','loss_train') WHERE pred IS NOT NULL")
+        labels = [str(i) for i in range(classes)]
+        probabilities = np.array([[p[label] for label in labels] for p in rows.probs])
+        assert (rows.pred != rows.y).all()
+        want = log_loss(rows.y, probabilities, labels=labels)
+        got = con.execute("SELECT log_loss FROM rf_class_oob('loss_model','loss_train','y')").fetchone()[0]
+        assert got == pytest.approx(want, rel=1e-14)

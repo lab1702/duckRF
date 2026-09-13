@@ -266,7 +266,9 @@ CREATE OR REPLACE MACRO __rf_q(vec, crit) AS (
              THEN list_sum(list_transform(vec, lambda x: x * x)) / list_sum(vec)
              ELSE list_sum(list_transform(vec, lambda x: x * (x / list_sum(vec)))) END
       WHEN 'entropy' THEN list_sum(list_transform(vec, lambda x:
-                              CASE WHEN x > 0 THEN x * log2(x / list_sum(vec)) ELSE 0.0 END))
+                              CASE WHEN x > 0 THEN x * (CASE WHEN x / list_sum(vec) > 0
+                                   THEN log2(x / list_sum(vec))
+                                   ELSE log2(x) - log2(list_sum(vec)) END) ELSE 0.0 END))
       ELSE CASE WHEN isfinite(vec[2] * vec[2]) AND vec[2] * vec[2] >= 2.2250738585072014e-308
                 THEN vec[2] * vec[2] / vec[1]
                 ELSE vec[2] * (vec[2] / vec[1]) END
@@ -328,7 +330,10 @@ CREATE OR REPLACE MACRO __rf_imp(vec, crit) AS (
       WHEN 'gini'    THEN 1.0 - list_sum(list_transform(vec, lambda x:
                               (x / list_sum(vec)) * (x / list_sum(vec))))
       WHEN 'entropy' THEN -list_sum(list_transform(vec, lambda x:
-                              CASE WHEN x > 0 THEN (x / list_sum(vec)) * log2(x / list_sum(vec))
+                              CASE WHEN x > 0 THEN
+                                   CASE WHEN x / list_sum(vec) > 0
+                                        THEN (x / list_sum(vec)) * log2(x / list_sum(vec))
+                                        ELSE (x * (log2(x) - log2(list_sum(vec)))) / list_sum(vec) END
                                    ELSE 0.0 END))
       -- Variance, floored at zero, uses node-local centered responses.
       -- Re-centering each child keeps a removed outlier from erasing its
@@ -1358,8 +1363,13 @@ CREATE OR REPLACE MACRO rf_batched_fit_sql(tbl, outcome, family, n_trees := 100,
 -- mismatch is an error -- a wrong table would otherwise return plausible,
 -- silently meaningless numbers, which is the worst failure mode there is.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE MACRO __rf_walk(model, tbl, caller, family, na_action, n_trees, oob) AS TABLE
+CREATE OR REPLACE MACRO __rf_walk(model, tbl, caller, family, na_action, n_trees, oob, row_source := NULL) AS TABLE
 WITH RECURSIVE
+-- Consumers that join original rows or outcomes share this ordinal-bearing
+-- snapshot with the walk. Re-scanning a volatile view would scramble identity.
+__rf_walk_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+),
 -- Forest metadata. It is constant on every model row, so any_value() is the
 -- idiom; this is the whole point of carrying it there.
 __rf_meta AS MATERIALIZED (
@@ -1390,8 +1400,8 @@ __rf_types AS MATERIALIZED (
 ),
 __rf_slong AS MATERIALIZED (
     SELECT __rf_rid__ AS rid, name AS col, value AS sval
-    FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
-                   FROM query_table(tbl))
+    FROM (UNPIVOT (SELECT __rf_rid__, CAST(COLUMNS(* EXCLUDE (__rf_rid__)) AS VARCHAR)
+                   FROM query_table(coalesce(row_source, '__rf_walk_rows')))
           ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value)
 ),
 -- Guards. As in __rf_fit, a guard only fires if its boolean is REFERENCED, so
@@ -1449,7 +1459,9 @@ __rf_usable AS MATERIALIZED (
     SELECT * FROM __rf_cells
     WHERE (kind = 'num' AND isfinite(v)) OR (kind = 'cat' AND lv IS NOT NULL)
 ),
-__rf_rowids AS (SELECT row_number() OVER () AS rid FROM query_table(tbl)),
+__rf_rowids AS (
+    SELECT __rf_rid__ AS rid FROM query_table(coalesce(row_source, '__rf_walk_rows'))
+),
 __rf_full AS (
     SELECT rid FROM __rf_usable
     GROUP BY rid
@@ -1603,19 +1615,25 @@ CREATE OR REPLACE MACRO __rf_famchk(model, caller, fam) AS (
 );
 
 CREATE OR REPLACE MACRO rf_reg_predict(model, tbl, na_action := 'null', n_trees := NULL) AS TABLE
+WITH __rf_input_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+)
 SELECT n.* EXCLUDE (__rf_rid__), p.prediction
-FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)) n
+FROM __rf_input_rows n
 CROSS JOIN (SELECT __rf_famchk(model, 'rf_reg_predict', 'regression') AS ok) g
 LEFT JOIN (
     SELECT rid, __rf_mean(list(prediction ORDER BY tree)) AS prediction
-    FROM __rf_walk(model, tbl, 'rf_reg_predict', 'regression', na_action, n_trees, false)
+    FROM __rf_walk(model, tbl, 'rf_reg_predict', 'regression', na_action, n_trees, false, row_source := '__rf_input_rows')
     GROUP BY rid
 ) p ON p.rid = n.__rf_rid__
 WHERE g.ok
 ORDER BY n.__rf_rid__;
 
 CREATE OR REPLACE MACRO rf_class_predict(model, tbl, na_action := 'null', n_trees := NULL) AS TABLE
-WITH __rf_cls AS (SELECT any_value(classes) AS classes FROM query_table(model)),
+WITH __rf_input_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+),
+__rf_cls AS (SELECT any_value(classes) AS classes FROM query_table(model)),
 -- Per (row, class): mean over the scoring trees of that tree's normalized count.
 __rf_prob AS (
     SELECT rid, cls, avg(cnt / wsum) AS p
@@ -1624,7 +1642,7 @@ __rf_prob AS (
                unnest(map_keys(class_counts))   AS cls,
                unnest(map_values(class_counts)) AS cnt,
                list_sum(map_values(class_counts)) AS wsum
-        FROM __rf_walk(model, tbl, 'rf_class_predict', 'classification', na_action, n_trees, false)
+        FROM __rf_walk(model, tbl, 'rf_class_predict', 'classification', na_action, n_trees, false, row_source := '__rf_input_rows')
     )
     GROUP BY rid, cls
 ),
@@ -1636,7 +1654,7 @@ __rf_agg AS (
     GROUP BY rid
 )
 SELECT n.* EXCLUDE (__rf_rid__), a.pred, a.probs
-FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)) n
+FROM __rf_input_rows n
 CROSS JOIN (SELECT __rf_famchk(model, 'rf_class_predict', 'classification') AS ok) g
 LEFT JOIN __rf_agg a ON a.rid = n.__rf_rid__
 WHERE g.ok
@@ -1701,6 +1719,9 @@ ORDER BY rid, tree;
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO __rf_reg_eval(model, tbl, outcome, caller, na_action, n_trees, oob) AS TABLE
 WITH
+__rf_input_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+),
 __rf_types AS MATERIALIZED (
     SELECT colname, typename
     FROM (SELECT * FROM (SELECT 1 AS __rf_one)
@@ -1709,7 +1730,7 @@ __rf_types AS MATERIALIZED (
 ),
 __rf_pred AS (
     SELECT rid, __rf_mean(list(prediction ORDER BY tree)) AS yhat
-    FROM __rf_walk(model, tbl, caller, 'regression', na_action, n_trees, oob)
+    FROM __rf_walk(model, tbl, caller, 'regression', na_action, n_trees, oob, row_source := '__rf_input_rows')
     GROUP BY rid
 ),
 -- The outcome column, pulled out via the same VARCHAR long-form as __rf_walk.
@@ -1720,8 +1741,8 @@ __rf_pred AS (
 __rf_truth AS (
     SELECT rid, __rf_number(sval, (SELECT typename FROM __rf_types WHERE colname = outcome)) AS y
     FROM (SELECT __rf_rid__ AS rid, name AS col, value AS sval
-          FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
-                         FROM query_table(tbl))
+          FROM (UNPIVOT (SELECT __rf_rid__, CAST(COLUMNS(* EXCLUDE (__rf_rid__)) AS VARCHAR)
+                         FROM __rf_input_rows)
                 ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value))
     WHERE col = outcome
 ),
@@ -1745,6 +1766,9 @@ WHERE ck.ok;
 
 CREATE OR REPLACE MACRO __rf_class_eval(model, tbl, outcome, caller, na_action, n_trees, oob) AS TABLE
 WITH
+__rf_input_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+),
 __rf_cls AS (SELECT any_value(classes) AS classes FROM query_table(model)),
 __rf_prob AS (
     SELECT rid, cls, avg(cnt / wsum) AS p
@@ -1752,7 +1776,7 @@ __rf_prob AS (
                  unnest(map_keys(class_counts))   AS cls,
                  unnest(map_values(class_counts)) AS cnt,
                  list_sum(map_values(class_counts)) AS wsum
-          FROM __rf_walk(model, tbl, caller, 'classification', na_action, n_trees, oob))
+          FROM __rf_walk(model, tbl, caller, 'classification', na_action, n_trees, oob, row_source := '__rf_input_rows'))
     GROUP BY rid, cls
 ),
 -- The outcome column via the VARCHAR long-form (see __rf_reg_eval): binds even
@@ -1761,8 +1785,8 @@ __rf_prob AS (
 __rf_truth AS (
     SELECT rid, sval AS y
     FROM (SELECT __rf_rid__ AS rid, name AS col, value AS sval
-          FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
-                         FROM query_table(tbl))
+          FROM (UNPIVOT (SELECT __rf_rid__, CAST(COLUMNS(* EXCLUDE (__rf_rid__)) AS VARCHAR)
+                         FROM __rf_input_rows)
                 ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value))
     WHERE col = outcome
 ),
@@ -1880,25 +1904,31 @@ ORDER BY importance DESC, feature;
 --   rf_class_oob_predict -> input rows + pred VARCHAR + probs MAP
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO rf_reg_oob_predict(model, tbl) AS TABLE
+WITH __rf_input_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+)
 SELECT n.* EXCLUDE (__rf_rid__), p.prediction
-FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)) n
+FROM __rf_input_rows n
 CROSS JOIN (SELECT __rf_famchk(model, 'rf_reg_oob_predict', 'regression') AS ok) g
 LEFT JOIN (
     SELECT rid, __rf_mean(list(prediction ORDER BY tree)) AS prediction
-    FROM __rf_walk(model, tbl, 'rf_reg_oob_predict', 'regression', 'null', NULL, true)
+    FROM __rf_walk(model, tbl, 'rf_reg_oob_predict', 'regression', 'null', NULL, true, row_source := '__rf_input_rows')
     GROUP BY rid
 ) p ON p.rid = n.__rf_rid__
 WHERE g.ok
 ORDER BY n.__rf_rid__;
 
 CREATE OR REPLACE MACRO rf_class_oob_predict(model, tbl) AS TABLE
-WITH __rf_prob AS (
+WITH __rf_input_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+),
+__rf_prob AS (
     SELECT rid, cls, avg(cnt / wsum) AS p
     FROM (SELECT rid,
                  unnest(map_keys(class_counts))   AS cls,
                  unnest(map_values(class_counts)) AS cnt,
                  list_sum(map_values(class_counts)) AS wsum
-          FROM __rf_walk(model, tbl, 'rf_class_oob_predict', 'classification', 'null', NULL, true))
+          FROM __rf_walk(model, tbl, 'rf_class_oob_predict', 'classification', 'null', NULL, true, row_source := '__rf_input_rows'))
     GROUP BY rid, cls
 ),
 __rf_agg AS (
@@ -1908,7 +1938,7 @@ __rf_agg AS (
     FROM __rf_prob GROUP BY rid
 )
 SELECT n.* EXCLUDE (__rf_rid__), a.pred, a.probs
-FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)) n
+FROM __rf_input_rows n
 CROSS JOIN (SELECT __rf_famchk(model, 'rf_class_oob_predict', 'classification') AS ok) g
 LEFT JOIN __rf_agg a ON a.rid = n.__rf_rid__
 WHERE g.ok
@@ -2694,6 +2724,12 @@ ORDER BY o.importance DESC, o.feature;
 CREATE OR REPLACE MACRO rf_reg_quantile(model, tbl, outcome, quantiles,
                                         newdata := NULL, na_action := 'null', n_trees := NULL) AS TABLE
 WITH
+__rf_reference_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(tbl)
+),
+__rf_query_rows AS MATERIALIZED (
+    SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(coalesce(newdata, tbl))
+),
 -- Column types of the reference and query tables (same DESCRIBE-free discovery
 -- trick as __rf_walk), used only by the guards below.
 __rf_reftypes AS MATERIALIZED (
@@ -2738,14 +2774,14 @@ __rf_qchk AS (
 -- Reference leaf membership, then its outcome via the tolerant long-form.
 __rf_refwalk AS MATERIALIZED (
     SELECT w.rid, w.tree, w.node
-    FROM __rf_walk(model, tbl, 'rf_reg_quantile', 'regression', na_action, n_trees, false) w
+    FROM __rf_walk(model, tbl, 'rf_reg_quantile', 'regression', na_action, n_trees, false, row_source := '__rf_reference_rows') w
     CROSS JOIN __rf_qchk ck WHERE ck.ok
 ),
 __rf_refy AS MATERIALIZED (
     SELECT rid, __rf_number(sval, (SELECT typename FROM __rf_reftypes WHERE colname = outcome)) AS y
     FROM (SELECT __rf_rid__ AS rid, name AS col, value AS sval
-          FROM (UNPIVOT (SELECT row_number() OVER () AS __rf_rid__, CAST(COLUMNS(*) AS VARCHAR)
-                         FROM query_table(tbl))
+          FROM (UNPIVOT (SELECT __rf_rid__, CAST(COLUMNS(* EXCLUDE (__rf_rid__)) AS VARCHAR)
+                         FROM __rf_reference_rows)
                 ON COLUMNS(* EXCLUDE (__rf_rid__)) INTO NAME name VALUE value))
     WHERE col = outcome
 ),
@@ -2764,7 +2800,7 @@ __rf_leafn AS MATERIALIZED (
 -- the reached leaf, so a subsampled reference still has total probability one.
 __rf_qwalk AS MATERIALIZED (
     SELECT w.rid, w.tree, w.node
-    FROM __rf_walk(model, coalesce(newdata, tbl), 'rf_reg_quantile', 'regression', na_action, n_trees, false) w
+    FROM __rf_walk(model, coalesce(newdata, tbl), 'rf_reg_quantile', 'regression', na_action, n_trees, false, row_source := '__rf_query_rows') w
     CROSS JOIN __rf_qchk ck WHERE ck.ok
 ),
 __rf_qtrees AS (
@@ -2809,7 +2845,7 @@ __rf_map AS (
     GROUP BY qrid
 )
 SELECT n.* EXCLUDE (__rf_rid__), m.quantile_pred
-FROM (SELECT row_number() OVER () AS __rf_rid__, * FROM query_table(coalesce(newdata, tbl))) n
+FROM __rf_query_rows n
 CROSS JOIN __rf_qchk g
 LEFT JOIN __rf_map m ON m.qrid = n.__rf_rid__
 WHERE g.ok

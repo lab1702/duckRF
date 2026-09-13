@@ -2456,3 +2456,51 @@ class TestSplitMassAndScaledMetrics:
         result = df_run(con, "SELECT * FROM rf_reg_evaluate('zm','large_errors','y')").iloc[0]
         assert result['n'] == 4 and result.rmse == magnitude and result.mae == magnitude and result.r2 == 0.0
         assert con.execute("SELECT * FROM rf_permutation_importance('zm','large_errors','y',n_repeats:=2)").fetchall() == [('x', 0.0, 0.0)]
+
+
+class TestScoringSnapshotsAndEntropy:
+    @pytest.mark.parametrize('family', ['reg', 'class'])
+    @pytest.mark.parametrize('threads', [1, 4])
+    @pytest.mark.parametrize('row_filter', ['', 'WHERE random() < 0.8'])
+    def test_volatile_view_rows_stay_aligned(self, con, family, threads, row_filter):
+        con.execute('SET threads = ' + str(threads))
+        try:
+            con.execute('CREATE OR REPLACE TABLE snap_train AS SELECT i x,10*i y FROM range(20) t(i)')
+            con.execute(f"CREATE OR REPLACE TABLE snap_model AS SELECT * FROM rf_{family}_fit('snap_train','y',n_trees:=1,replace_sample:=false,max_depth:=NULL)")
+            con.execute(f'CREATE OR REPLACE VIEW snap_view AS SELECT * FROM snap_train {row_filter} ORDER BY random()')
+            rows = df_run(con, f"SELECT * FROM rf_{family}_predict('snap_model','snap_view')")
+            pred = rows.prediction if family == 'reg' else rows.pred.astype(int)
+            np.testing.assert_array_equal(pred, rows.y)
+            metrics = df_run(con, f"SELECT * FROM rf_{family}_evaluate('snap_model','snap_view','y')").iloc[0]
+            assert 0 < metrics['n'] <= 20
+            if family == 'reg':
+                assert metrics.rmse == 0 and metrics.mae == 0 and metrics.r2 == 1
+            else:
+                assert metrics.accuracy == 1 and metrics.brier == 0
+        finally:
+            con.execute('SET threads = 1')
+
+    @pytest.mark.parametrize('reference,query', [
+        ('snap_train', 'snap_view'), ('snap_view', 'snap_train'),
+        ('snap_view', 'snap_view'), ('snap_view', None),
+    ])
+    def test_quantile_volatile_reference_and_query(self, con, reference, query):
+        con.execute('CREATE OR REPLACE TABLE snap_train AS SELECT i x,10*i y FROM range(20) t(i)')
+        con.execute("CREATE OR REPLACE TABLE snap_model AS SELECT * FROM rf_reg_fit('snap_train','y',n_trees:=1,replace_sample:=false,max_depth:=NULL)")
+        con.execute('CREATE OR REPLACE VIEW snap_view AS SELECT * FROM snap_train ORDER BY random()')
+        extra = '' if query is None else f",newdata:='{query}'"
+        rows = con.execute(f"SELECT y,quantile_pred[0.5] FROM rf_reg_quantile('snap_model','{reference}','y',[0.5]{extra})").fetchall()
+        assert len(rows) == 20
+        assert all(y == q for y, q in rows)
+
+    def test_entropy_positive_probability_underflow(self, con):
+        con.execute('CREATE OR REPLACE TABLE entropy_extreme AS SELECT i x,i y,CASE i WHEN 0 THEN 1e-200 ELSE 1e200 END w FROM range(2) t(i)')
+        model = df_run(con, "SELECT * FROM rf_class_fit('entropy_extreme','y',n_trees:=1,replace_sample:=false,criterion:='entropy',weights_col:='w')")
+        assert len(model) == 1 and model.impurity.iloc[0] == 0
+        # The weighted score remains representable even when p = x / total is 0.
+        q = con.execute("SELECT __rf_q([1e-200,1e200]::DOUBLE[],'entropy')").fetchone()[0]
+        assert q == pytest.approx(-400 * np.log2(10) * 1e-200, rel=1e-14, abs=0)
+
+        imp = con.execute("SELECT __rf_imp([1e-200,1e124]::DOUBLE[],'entropy')").fetchone()[0]
+        assert imp > 0
+        assert imp == pytest.approx((324 * np.log2(10) * 1e-200) / 1e124, abs=5e-324)

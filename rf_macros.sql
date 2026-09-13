@@ -292,23 +292,31 @@ CREATE OR REPLACE MACRO __rf_r2(n, sse, sst) AS
          WHEN sst = 0 THEN CASE WHEN sse = 0 THEN 1.0 ELSE 0.0 END
          ELSE 1.0 - sse / sst END;
 
--- Scale residuals and target deviations together before squaring. This keeps
--- RMSE and SSE/SST representable when an unnormalized sum of squares overflows.
+-- Scale residuals and target deviations separately before squaring. A large
+-- prediction error must not erase target variation or turn a nonconstant target
+-- into the constant-target R2 special case.
 CREATE OR REPLACE MACRO __rf_reg_stats(ys, ps) AS (
     WITH __rf_metric_rows AS (
         SELECT unnest(ys) AS y, unnest(ps) AS p, generate_subscripts(ys, 1) AS i
     ),
-    __rf_metric_center AS (SELECT __rf_mean(ys) AS ybar),
+    __rf_metric_center AS (
+        SELECT list_min(ys) = list_max(ys) AS constant_y,
+               CASE WHEN list_min(ys) = list_max(ys) THEN list_min(ys)
+                    ELSE __rf_mean(ys) END AS ybar
+    ),
     __rf_metric_scale AS (
-        SELECT CASE WHEN isfinite(max(greatest(abs(y-p), abs(y-ybar))))
-                    THEN coalesce(nullif(max(greatest(abs(y-p), abs(y-ybar))), 0.0), 1.0)
-                    ELSE max(greatest(abs(y), abs(p))) END AS scale
+        SELECT CASE WHEN isfinite(max(abs(y-p)))
+                    THEN coalesce(nullif(max(abs(y-p)), 0.0), 1.0)
+                    ELSE max(greatest(abs(y), abs(p))) END AS escale,
+               CASE WHEN isfinite(max(abs(y-ybar)))
+                    THEN coalesce(nullif(max(abs(y-ybar)), 0.0), 1.0)
+                    ELSE max(greatest(abs(y), abs(ybar))) END AS dscale
         FROM __rf_metric_rows, __rf_metric_center
     ),
     __rf_metric_norm AS (
         SELECT i,
-               CASE WHEN isfinite(y-p) THEN (y-p)/scale ELSE y/scale-p/scale END AS e,
-               CASE WHEN isfinite(y-ybar) THEN (y-ybar)/scale ELSE y/scale-ybar/scale END AS d
+               CASE WHEN isfinite(y-p) THEN (y-p)/escale ELSE y/escale-p/escale END AS e,
+               CASE WHEN isfinite(y-ybar) THEN (y-ybar)/dscale ELSE y/dscale-ybar/dscale END AS d
         FROM __rf_metric_rows, __rf_metric_center, __rf_metric_scale
     ),
     __rf_metric_sums AS (
@@ -316,9 +324,12 @@ CREATE OR REPLACE MACRO __rf_reg_stats(ys, ps) AS (
                list_sum(list(d*d ORDER BY i)) AS sst, list_sum(list(abs(e) ORDER BY i)) AS sae
         FROM __rf_metric_norm
     )
-    SELECT struct_pack(n := n, rmse := sqrt(sse/n)*scale, mae := (sae/n)*scale,
-                       r2 := __rf_r2(n,sse,sst))
-    FROM __rf_metric_sums, __rf_metric_scale
+    SELECT struct_pack(n := n, rmse := sqrt(sse/n)*escale, mae := (sae/n)*escale,
+                       r2 := CASE WHEN n < 2 THEN NULL
+                                  WHEN sse = 0 THEN 1.0
+                                  WHEN constant_y THEN 0.0
+                                  ELSE 1.0 - pow(sqrt(sse/sst)*(escale/dscale), 2) END)
+    FROM __rf_metric_sums, __rf_metric_scale, __rf_metric_center
 );
 
 -- SQL numeric equality identifies both signed zeros; bucket identity must too.
@@ -2356,7 +2367,10 @@ __rf_cv_err AS (
     FROM __rf_cv_clspred p JOIN __rf_cv_ysval y ON y.rid = p.rid WHERE family='classification'
     GROUP BY p.gidx
     UNION ALL
-    SELECT p.gidx, avg((y.yv - p.yhat)*(y.yv - p.yhat)) AS err
+    SELECT p.gidx,
+           CASE WHEN isfinite(avg((y.yv - p.yhat)*(y.yv - p.yhat)))
+                THEN avg((y.yv - p.yhat)*(y.yv - p.yhat))
+                ELSE pow((__rf_reg_stats(list(y.yv), list(p.yhat))).rmse, 2) END AS err
     FROM __rf_cv_regpred p JOIN __rf_cv_ysval y ON y.rid = p.rid WHERE family='regression'
     GROUP BY p.gidx
 ),

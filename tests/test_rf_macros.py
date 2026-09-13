@@ -2530,3 +2530,33 @@ class TestEntropyGainOverflow:
         if minimum_gain == 0:
             assert len(large) == 7
             assert con.execute("SELECT accuracy FROM rf_class_evaluate('entropy_large','entropy_scale','y')").fetchone()[0] == 1.0
+
+
+class TestRegressionMetricScaleSeparation:
+    def test_rounded_constant_target_has_zero_imperfect_r2(self, con):
+        con.execute('CREATE OR REPLACE TABLE metric_train AS SELECT i x,0.2::DOUBLE y FROM range(6)t(i)')
+        con.execute("CREATE OR REPLACE TABLE metric_model AS SELECT * FROM rf_reg_fit('metric_train','y',n_trees:=1,replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE metric_test AS SELECT i x,0.1::DOUBLE y FROM range(6)t(i)')
+        metrics = df_run(con, "SELECT * FROM rf_reg_evaluate('metric_model','metric_test','y')").iloc[0]
+        assert metrics.r2 == 0
+        assert metrics.rmse == pytest.approx(0.1)
+        assert metrics.mae == pytest.approx(0.1)
+        assert con.execute('SELECT (__rf_reg_stats([0.1,0.1,0.1,0.1,0.1,0.1], [0.1,0.1,0.1,0.1,0.1,0.1])).r2').fetchone()[0] == 1
+
+    def test_large_errors_do_not_make_target_constant(self, con):
+        con.execute('CREATE OR REPLACE TABLE metric_train AS SELECT i x,1e308 y FROM range(2)t(i)')
+        con.execute("CREATE OR REPLACE TABLE metric_model AS SELECT * FROM rf_reg_fit('metric_train','y',n_trees:=1,replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE metric_test AS SELECT i x,i y FROM range(2)t(i)')
+        metrics = df_run(con, "SELECT * FROM rf_reg_evaluate('metric_model','metric_test','y')").iloc[0]
+        assert metrics.r2 == -np.inf
+        assert metrics.rmse == 1e308 and metrics.mae == 1e308
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    def test_cv_mse_remains_finite_when_one_squared_error_overflows(self, con, macro):
+        con.execute('CREATE OR REPLACE TABLE metric_cv AS SELECT * FROM (VALUES (0,0.0::DOUBLE),(1,0.0::DOUBLE),(2,1.4e154::DOUBLE)) t(x,y)')
+        score = con.execute(f"SELECT * FROM {macro}('metric_cv','y','regression',[1],k:=3,n_trees:=1,sample_frac:=0.01,seed:=1)").fetchone()[1]
+        # The deterministic bootstrap selects a zero-response training row in
+        # every fold, so the three held-out residuals are 0, 0, and 1.4e154.
+        expected = (1.4e154 / np.sqrt(3)) ** 2
+        assert np.isfinite(score)
+        assert score == pytest.approx(expected, rel=1e-14)

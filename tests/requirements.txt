@@ -6,3 +6,4 @@ pandas
 scikit-learn
 scipy
 pytest
+pytest-xdist

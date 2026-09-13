@@ -36,6 +36,9 @@ python -m venv .venv
 .venv/bin/python -m pytest tests/ -q
 ```
 
+Tests run in parallel by default via pytest-xdist (`-n auto`). Use `-n 0` for
+a serial run, or `-n 4` to choose a fixed number of workers.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits on deterministic inline data and

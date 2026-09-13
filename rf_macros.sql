@@ -2861,10 +2861,12 @@ __rf_dist AS (
 ),
 -- Normalize the integer cumulative mass by its realized total. The final CDF
 -- is one, while empirical boundaries such as 7/35 round directly to 0.2.
+-- Parse the exact integer decimal text: direct HUGEINT-to-DOUBLE conversion
+-- can round a large numerator incorrectly (for example the 28/29 boundary).
 __rf_cum AS (
     SELECT qrid, y,
-           sum(w) OVER (PARTITION BY qrid ORDER BY y ROWS UNBOUNDED PRECEDING)
-             / sum(w) OVER (PARTITION BY qrid) AS cw
+           (sum(w) OVER (PARTITION BY qrid ORDER BY y ROWS UNBOUNDED PRECEDING))::VARCHAR::DOUBLE
+             / (sum(w) OVER (PARTITION BY qrid))::VARCHAR::DOUBLE AS cw
     FROM __rf_dist
 ),
 -- Type-1 inverse CDF: smallest response whose cumulative weight first reaches the

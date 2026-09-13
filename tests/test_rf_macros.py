@@ -2660,3 +2660,16 @@ class TestClassificationSubnormalWeights:
             con.execute(f"SELECT * FROM rf_class_fit('class_tiny','y',n_trees:=1,replace_sample:=false,weights_col:='w',min_impurity_decrease:=0.1,criterion:='{criterion}',splitter:='{splitter}')").fetchall()
         con.execute('UPDATE class_tiny SET w=1.0')
         assert con.execute(f"SELECT count(*) FROM rf_class_fit('class_tiny','y',n_trees:=1,replace_sample:=false,weights_col:='w',min_impurity_decrease:=0.1,criterion:='{criterion}',splitter:='{splitter}')").fetchone()[0] > 1
+
+
+class TestQuantileIntegerConversion:
+    @pytest.mark.parametrize('size', [29, 31, 47, 53, 97])
+    def test_all_empirical_boundaries_and_immediate_successors(self, con, size):
+        con.execute('CREATE OR REPLACE TABLE ratio_ref AS SELECT 0 x,CASE WHEN i=? THEN 1000000 ELSE i END y FROM range(?)t(i)', [size-1, size])
+        con.execute("CREATE OR REPLACE TABLE ratio_model AS SELECT * FROM rf_reg_fit('ratio_ref','y',n_trees:=1,replace_sample:=false)")
+        con.execute('CREATE OR REPLACE TABLE ratio_query AS SELECT 0 x')
+        boundaries = [k/size for k in range(1, size)]
+        levels = sorted(boundaries + [np.nextafter(q, 1.0) for q in boundaries])
+        got = con.execute("SELECT quantile_pred FROM rf_reg_quantile('ratio_model','ratio_ref','y',?::DOUBLE[],newdata:='ratio_query')", [[float(q) for q in levels]]).fetchone()[0]
+        ys = np.array(list(range(size-1)) + [1000000])
+        assert got == _wquantile_type1(ys, np.ones(size), levels)

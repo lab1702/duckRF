@@ -925,6 +925,20 @@ class TestWeights:
 # 11. Cross-validation tuning
 # ===========================================================================
 class TestCV:
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    @pytest.mark.parametrize('args', ['k:=2,n_trees:=1', 'k:=1,n_trees:=1', 'k:=2,n_trees:=0'])
+    def test_empty_source_rejects_cv(self, con, macro, args):
+        con.execute('CREATE OR REPLACE TABLE empty_cv(x INTEGER, y INTEGER)')
+        with pytest.raises(DuckDBError, match='no complete rows'):
+            con.execute(f"SELECT * FROM {macro}('empty_cv','y','regression',[1],{args})").fetchall()
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    @pytest.mark.parametrize('family', ['regression', 'classification'])
+    def test_cv_rejects_no_features(self, con, macro, family):
+        con.execute('CREATE OR REPLACE TABLE featureless_cv AS SELECT i y FROM range(10)t(i)')
+        with pytest.raises(DuckDBError, match='no feature columns'):
+            con.execute(f"SELECT * FROM {macro}('featureless_cv','y','{family}',[1],k:=2,n_trees:=1)").fetchall()
+
     def test_rf_cv_regression_grid(self, con):
         rng = np.random.default_rng(1)
         X = rng.normal(size=(300, 4))

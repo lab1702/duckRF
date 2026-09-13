@@ -2097,6 +2097,12 @@ __rf_cv_chk AS (
              WHEN starts_with(lower(tbl), '__rf_')
                   OR (SELECT count(*) FROM __rf_cv_types WHERE starts_with(lower(colname), '__rf_')) > 0
                THEN error('rf_cv: table and column names beginning with __rf_ are reserved')
+             WHEN (SELECT d FROM __rf_cv_d) = 0
+               THEN error('rf_cv: no feature columns besides the outcome')
+             -- Empty input has NULL type-discovery values; reject it before
+             -- constructing a type diagnostic, which would itself become NULL.
+             WHEN (SELECT count(*) FROM __rf_cv_complete) = 0
+               THEN error('rf_cv: no complete rows')
              WHEN (SELECT count(*) FROM __rf_cv_featcols WHERE kind IS NULL) > 0
                THEN error('rf_cv: unsupported feature type: ' ||
                           (SELECT string_agg(colname || ' (' || typename || ')', ', ')
@@ -2133,7 +2139,6 @@ __rf_cv_chk AS (
                THEN error('rf_cv: min_samples_leaf must be >= 1')
              WHEN seed IS NULL THEN error('rf_cv: seed must not be NULL')
              WHEN n_trees IS NULL OR n_trees < 1 THEN error('rf_cv: n_trees must be >= 1')
-             WHEN (SELECT count(*) FROM __rf_cv_complete) = 0 THEN error('rf_cv: no complete rows')
              ELSE true END AS ok
 ),
 __rf_cv_rows AS MATERIALIZED (
@@ -2391,28 +2396,22 @@ __rf_cv_err AS (
     FROM __rf_cv_regpred p JOIN __rf_cv_ysval y ON y.rid = p.rid WHERE family='regression'
     GROUP BY p.gidx
 ),
--- Family / outcome guards that DO NOT depend on any family-gated CTE. __rf_cv_chk
--- (k / grid / n_trees / complete-rows) is forced only via __rf_cv_rows, which feeds
--- the recursion -> __rf_cv_err; but __rf_cv_err's two branches are each gated on
--- family = one of the two valid literals, so an ILLEGAL family (or a nonexistent
--- outcome, which makes __rf_cv_ysval and hence __rf_cv_err empty) constant-folds the
--- whole result to empty, the optimizer prunes __rf_cv_rows, and __rf_cv_chk's error()
--- never runs -- the query silently returns zero rows. These two checks live in a
--- single-row guard CTE that DRIVES the final SELECT (LEFT JOIN __rf_cv_err), so it
--- is always evaluated regardless of whether __rf_cv_err is empty.
+-- Validate independently of the recursion, which can be pruned for empty input
+-- or an invalid family/outcome. Force all input and parameter checks from this
+-- single-row guard even when there are no cross-validation scores.
 __rf_cv_guard AS (
     SELECT CASE
              WHEN family IS NULL OR family NOT IN ('classification', 'regression')
                THEN error('rf_cv: family must be ''classification'' or ''regression'', got ''' || coalesce(family, 'NULL') || '''')
              WHEN (SELECT count(*) FROM __rf_cv_types WHERE colname = outcome) = 0
                THEN error('rf_cv: outcome column "' || outcome || '" not found in "' || tbl || '"')
-             ELSE true
+             ELSE (SELECT ok FROM __rf_cv_chk)
            END AS ok
 )
 SELECT grid[e.gidx] AS param, e.err AS cv_error
 FROM __rf_cv_guard g
 LEFT JOIN __rf_cv_err e ON true
-WHERE g.ok AND e.gidx IS NOT NULL
+WHERE g.ok
 ORDER BY e.gidx;
 
 CREATE OR REPLACE MACRO rf_cv(tbl, outcome, family, mtry_grid, k := 5, n_trees := 100,

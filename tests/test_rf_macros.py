@@ -2560,3 +2560,21 @@ class TestRegressionMetricScaleSeparation:
         expected = (1.4e154 / np.sqrt(3)) ** 2
         assert np.isfinite(score)
         assert score == pytest.approx(expected, rel=1e-14)
+
+
+class TestRegressionMomentUnderflow:
+    @pytest.mark.parametrize('splitter', ['best', 'random'])
+    @pytest.mark.parametrize('weight,response_step', [(1e-320, 0.01), (1.0, 1e-170)])
+    def test_unrepresentable_moment_errors_before_false_purity(self, con, splitter, weight, response_step):
+        con.execute('CREATE OR REPLACE TABLE underflow_fit AS SELECT i x,i*? y,? w FROM range(2)t(i)', [response_step, weight])
+        with pytest.raises(DuckDBError, match='regression moment underflow; rescale'):
+            con.execute(f"SELECT * FROM rf_reg_fit('underflow_fit','y',weights_col:='w',n_trees:=1,replace_sample:=false,splitter:='{splitter}')").fetchall()
+        con.execute('CREATE OR REPLACE TABLE underflow_fit AS SELECT i x,i*0.01 y,1.0 w FROM range(2)t(i)')
+        rows = con.execute(f"SELECT prediction FROM rf_reg_fit('underflow_fit','y',weights_col:='w',n_trees:=1,replace_sample:=false,splitter:='{splitter}') WHERE is_leaf ORDER BY node").fetchall()
+        np.testing.assert_allclose([r[0] for r in rows], [0.0, 0.01], atol=0)
+
+    @pytest.mark.parametrize('macro', ['rf_cv', 'rf_cv_depth'])
+    def test_cv_rejects_underflowing_response_moments(self, con, macro):
+        con.execute('CREATE OR REPLACE TABLE underflow_cv AS SELECT i x,CASE WHEN i%4<2 THEN 0.0 ELSE 1e-170 END y FROM range(20)t(i)')
+        with pytest.raises(DuckDBError, match='regression moment underflow; rescale'):
+            con.execute(f"SELECT * FROM {macro}('underflow_cv','y','regression',[1],k:=2,n_trees:=2)").fetchall()

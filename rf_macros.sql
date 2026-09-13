@@ -366,6 +366,14 @@ CREATE OR REPLACE MACRO __rf_gain(lvec, rvec, pvec, crit, qpar) AS (
 );
 
 
+-- A vanished nonzero moment would falsely mark an impure regression node pure.
+-- Apply this before squaring a response deviation and before weighting its slot.
+CREATE OR REPLACE MACRO __rf_moment_mul(a, b, caller) AS (
+    CASE WHEN a != 0 AND b != 0 AND a * b = 0
+         THEN error(caller || ': regression moment underflow; rescale outcomes or sample weights')
+         ELSE a * b END
+);
+
 -- Detect unrepresentable intermediate moments before they can become model rows.
 CREATE OR REPLACE MACRO __rf_moment_ok(vec, crit, caller) AS
     CASE WHEN crit = 'mse' AND
@@ -756,7 +764,7 @@ __rf_tr AS (
         UNION ALL
         SELECT c.tree, c.node, c.rid, sl.slot,
                CASE sl.slot WHEN 1 THEN 1.0 WHEN 2 THEN y.yv - nc.center
-                    ELSE (y.yv - nc.center) * (y.yv - nc.center) END AS u
+                    ELSE __rf_moment_mul(y.yv - nc.center, y.yv - nc.center, caller) END AS u
         FROM cur c JOIN __rf_y y ON y.rid = c.rid
         JOIN ncenter nc ON nc.tree = c.tree AND nc.node = c.node
         CROSS JOIN (SELECT unnest([1,2,3]) AS slot) sl
@@ -764,7 +772,7 @@ __rf_tr AS (
      -- Sparse slot sums, then densified against the full slot list: a class
      -- absent from a node must still occupy its position in the vector.
      nsl AS (
-        SELECT c.tree, c.node, u.slot, list_sum(list(c.w * u.u ORDER BY c.rid)) AS s
+        SELECT c.tree, c.node, u.slot, list_sum(list(__rf_moment_mul(c.w, u.u, caller) ORDER BY c.rid)) AS s
         FROM cur c JOIN nu u ON u.tree = c.tree AND u.node = c.node AND u.rid = c.rid
         GROUP BY c.tree, c.node, u.slot
      ),
@@ -2208,12 +2216,12 @@ __rf_cv_tr AS (
         UNION ALL
         SELECT c.g,c.tree,c.node,c.rid,sl.slot,
                CASE sl.slot WHEN 1 THEN 1.0 WHEN 2 THEN y.yv-nc.center
-                    ELSE (y.yv-nc.center)*(y.yv-nc.center) END AS u
+                    ELSE __rf_moment_mul(y.yv-nc.center, y.yv-nc.center, 'rf_cv') END AS u
         FROM cur c JOIN __rf_cv_y y ON y.rid=c.rid
         JOIN ncenter nc ON nc.g=c.g AND nc.tree=c.tree AND nc.node=c.node
         CROSS JOIN (SELECT unnest([1,2,3]) AS slot) sl
      ),
-     nsl AS (SELECT c.g, c.tree, c.node, u.slot, sum(c.w*u.u) AS s
+     nsl AS (SELECT c.g, c.tree, c.node, u.slot, sum(__rf_moment_mul(c.w, u.u, 'rf_cv')) AS s
              FROM cur c JOIN nu u ON u.g=c.g AND u.tree=c.tree AND u.node=c.node AND u.rid=c.rid GROUP BY c.g, c.tree, c.node, u.slot),
      ns AS (SELECT g, tree, node, any_value(depth) AS depth, count(*) AS nrows, sum(w) AS wn
             FROM cur GROUP BY g, tree, node),
